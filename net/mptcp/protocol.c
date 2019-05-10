@@ -112,7 +112,6 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 	psize = copy_page_from_iter(pfrag->page, pfrag->offset,
 				    min_t(size_t, msg_data_left(msg), psize),
 				    &msg->msg_iter);
-	pr_debug("left=%zu", msg_data_left(msg));
 	if (!psize)
 		return -EINVAL;
 
@@ -121,6 +120,7 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 	 */
 	ret = do_tcp_sendpages(ssk, pfrag->page, pfrag->offset, psize,
 			       msg->msg_flags | MSG_SENDPAGE_NOTLAST);
+	pr_debug("psize=%lu ret=%u\n", psize, ret);
 	if (ret <= 0)
 		return ret;
 	if (unlikely(ret < psize))
@@ -131,6 +131,9 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 	if (collapsed) {
 		/* when collapsing mpext always exists */
 		mpext->data_len += ret;
+		pr_debug("(collapsed) skb %lx ext %lx subflow_seq=%u data_len=%u delta=%u",
+			 (unsigned long)skb, (unsigned long)mpext,
+			 mpext->subflow_seq, mpext->data_len, ret);
 		goto out;
 	}
 
@@ -145,7 +148,8 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 		mpext->use_map = 1;
 		mpext->dsn64 = 1;
 
-		pr_debug("data_seq=%llu subflow_seq=%u data_len=%u checksum=%u, dsn64=%d",
+		pr_debug("skb %lx ext %lx data_seq=%llu subflow_seq=%u data_len=%u checksum=%u, dsn64=%d",
+			 (unsigned long)skb, (unsigned long)mpext,
 			 mpext->data_seq, mpext->subflow_seq, mpext->data_len,
 			 mpext->checksum, mpext->dsn64);
 	}
@@ -305,11 +309,15 @@ static enum mapping_status mptcp_get_mapping(struct sock *ssk)
 	mpext = mptcp_get_ext(skb);
 
 	if (!mpext) {
+		if (!subflow->map_valid)
+			pr_err("no ext skb %p len %d", skb, skb->len);
 		/* This is expected for non-DSS data packets */
 		return MAPPING_MISSING;
 	}
 
 	if (!mpext->use_map) {
+		if (!subflow->map_valid)
+			pr_err("no map skb %p len %d", skb, skb->len);
 		ret = MAPPING_MISSING;
 		goto del_out;
 	}
@@ -330,7 +338,9 @@ static enum mapping_status mptcp_get_mapping(struct sock *ssk)
 	}
 
 	if (subflow->map_valid)
-		pr_warn("Replaced mapping before it was done");
+		pr_warn("Replaced mapping before it was done: start %d len %d offset %d",
+		        subflow->map_subflow_seq, subflow->map_data_len,
+		        tcp_sk(ssk)->copied_seq - subflow->ssn_offset);
 
 	if (!mpext->dsn64) {
 		subflow->map_seq = expand_seq(subflow->map_seq,
@@ -391,7 +401,7 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 	while (copied < len) {
 		enum mapping_status status;
 		size_t discard_len = 0;
-		u32 map_remaining;
+		u32 map_remaining, off;
 		int bytes_read;
 		u64 ack_seq;
 		u64 old_ack;
@@ -403,7 +413,7 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 			/* Common case, but nothing to do here */
 		} else if (status == MAPPING_MISSING) {
 			if (!subflow->map_valid) {
-				pr_debug("Mapping missing, trying next skb");
+				pr_err("Mapping missing, trying next skb");
 
 				arg.msg = NULL;
 				desc.count = SIZE_MAX;
@@ -435,7 +445,7 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 			/* Mapping covers data later in the subflow stream,
 			 * discard unmapped data.
 			 */
-			pr_debug("Mapping covers data later in stream");
+			pr_err("Mapping covers data later in stream");
 			discard_len = subflow->map_subflow_seq - ssn;
 		} else if (unlikely(!before(ssn, (subflow->map_subflow_seq +
 						  subflow->map_data_len)))) {
@@ -443,7 +453,7 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 			 * Invalidate the mapping and try again.
 			 */
 			subflow->map_valid = 0;
-			pr_debug("Invalid mapping ssn=%d map_seq=%d map_data_len=%d",
+			pr_err("Invalid mapping ssn=%d map_seq=%d map_data_len=%d",
 				 ssn, subflow->map_subflow_seq,
 				 subflow->map_data_len);
 			continue;
@@ -460,14 +470,14 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 				discard_len = min(map_end_dsn - ack_seq,
 						  old_ack - ack_seq);
 				subflow->map_valid = 0;
-				pr_debug("Duplicate MPTCP data found");
+				pr_err("Duplicate MPTCP data found");
 			}
 		}
 
 		if (discard_len) {
 			/* Discard data for the current mapping.
 			 */
-			pr_debug("Discard %zu bytes", discard_len);
+			pr_err("Discard %zu bytes", discard_len);
 
 			arg.msg = NULL;
 			desc.count = discard_len;
@@ -484,7 +494,8 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		}
 
 		/* Read mapped data */
-		map_remaining = subflow->map_data_len - get_map_offset(subflow);
+		off = get_map_offset(subflow);
+		map_remaining = subflow->map_data_len - off;
 		desc.count = min_t(size_t, len - copied, map_remaining);
 		arg.msg = msg;
 		bytes_read = tcp_read_sock(ssk, &desc, mptcp_read_actor);
@@ -493,6 +504,13 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 
 		/* Refresh current MPTCP sequence number based on subflow seq */
 		ack_seq = get_mapped_dsn(subflow);
+		pr_debug("readed %d(req %ld) bytes, map offset %d->%lld "
+			 "map len %d delta ack %lld map completed %d\n",
+			 bytes_read, min_t(size_t, len - copied, map_remaining),
+			 off, get_map_offset(subflow), subflow->map_data_len,
+			 ack_seq - old_ack,
+			 !before(tcp_sk(ssk)->copied_seq - subflow->ssn_offset,
+			    subflow->map_subflow_seq + subflow->map_data_len));
 
 		if (before64(old_ack, ack_seq))
 			atomic64_set(&msk->ack_seq, ack_seq);

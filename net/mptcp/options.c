@@ -285,6 +285,9 @@ bool mptcp_established_options_dss(struct sock *sk, struct sk_buff *skb,
 			remaining -= map_size;
 			dss_size = map_size;
 			if (mpext) {
+				pr_debug("skb %lx ext %lx values data_seq=%llu subflow_seq=%u",
+					 (unsigned long)skb, (unsigned long)mpext,
+					 mpext->data_seq, mpext->subflow_seq);
 				opts->ext_copy.data_seq = mpext->data_seq;
 				opts->ext_copy.subflow_seq = mpext->subflow_seq;
 				opts->ext_copy.data_len = mpext->data_len;
@@ -449,7 +452,8 @@ void mptcp_write_options(__be32 *ptr, struct mptcp_out_options *opts)
 		if (mpext->use_map) {
 			__sum16 checksum;
 
-			pr_debug("Writing map values");
+			pr_debug("Writing map values data_seq=%llu subflow_seq=%u",
+				 mpext->data_seq, mpext->subflow_seq);
 			put_unaligned_be64(mpext->data_seq, ptr);
 			ptr += 2;
 			*ptr++ = htonl(mpext->subflow_seq);
