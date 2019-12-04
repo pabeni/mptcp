@@ -368,7 +368,7 @@ static inline bool insn_is_zext(const struct bpf_insn *insn)
 		.dst_reg = 0,					\
 		.src_reg = 0,					\
 		.off   = 0,					\
-		.imm   = ((FUNC) - __bpf_call_base) })
+		.imm   = ((__force void*)(FUNC) - (__force void*)__bpf_call_base) })
 
 /* Raw code statement block */
 
