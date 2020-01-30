@@ -605,6 +605,8 @@ static int __mptcp_init_sock(struct sock *sk)
 
 	msk->first = NULL;
 
+	mptcp_pm_data_init(msk);
+
 	return 0;
 }
 
