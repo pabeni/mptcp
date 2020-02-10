@@ -31,4 +31,46 @@ enum {
 };
 
 #define MPTCP_SUBFLOW_MAX (__MPTCP_SUBFLOW_MAX - 1)
+
+/* netlink interface */
+#define MPTCP_PM_NAME		"mptcp_pm"
+#define MPTCP_PM_CMD_GRP_NAME	"mptcp_pm_cmds"
+#define MPTCP_PM_VER		0x1
+
+/*
+ * ATTR types defined for MPTCP
+ */
+enum mptcp_pm_attrs {
+	MPTCP_PM_ATTR_UNSPEC,
+
+	MPTCP_PM_ATTR_ADDR_LIST,			/* nested list */
+	MPTCP_PM_ATTR_ADD_ADDR_MAX,			/* u32 */
+
+	__MPTCP_PM_ATTR_MAX
+};
+
+#define MPTCP_PM_ATTR_MAX (__MPTCP_PM_ATTR_MAX - 1)
+
+enum mptcp_pm_addr_addrs {
+	MPTCP_PM_ADDR_ATTR_UNSPEC,
+
+	MPTCP_PM_ADDR_ATTR_FAMILY,			/* u16 */
+	MPTCP_PM_ADDR_ATTR_ADDR4,			/* u32 */
+	MPTCP_PM_ADDR_ATTR_ADDR6,			/* struct in6_addr */
+
+	__MPTCP_PM_ADDR_ATTR_MAX
+};
+
+#define MPTCP_PM_ADDR_ATTR_MAX (__MPTCP_PM_ADDR_ATTR_MAX - 1)
+
+enum {
+	MPTCP_CMD_UNSPEC,
+
+	MPTCP_CMD_NS_SIGNAL,
+	MPTCP_CMD_NS_LOCAL,
+	MPTCP_CMD_NS_ADD_ADDR_MAX,
+
+	__MPTCP_CMD_AFTER_LAST
+};
+
 #endif /* _UAPI_MPTCP_H */
