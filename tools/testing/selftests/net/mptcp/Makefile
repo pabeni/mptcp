@@ -2,11 +2,11 @@
 
 top_srcdir = ../../../../..
 
-CFLAGS =  -Wall -Wl,--no-as-needed -O2 -g
+CFLAGS =  -Wall -Wl,--no-as-needed -O2 -g  -iquote../../../../../include/uapi/
 
 TEST_PROGS := mptcp_connect.sh
 
-TEST_GEN_FILES = mptcp_connect
+TEST_GEN_FILES = mptcp_connect pm_nl_ctl
 
 EXTRA_CLEAN := *.pcap
 
