@@ -480,10 +480,10 @@ out:
 static void __flush_addrs(struct pm_nl_pernet *pernet)
 {
 	while (!list_empty(&pernet->addr_list)) {
-		struct mptcp_pm_addr_entry *cur = list_entry(&pernet->addr_list,
-						     struct mptcp_pm_addr_entry,
-						     list);
+		struct mptcp_pm_addr_entry *cur;
 
+		cur = list_entry(pernet->addr_list.next,
+				 struct mptcp_pm_addr_entry, list);
 		list_del_rcu(&cur->list);
 		kfree_rcu(cur, rcu);
 	}
@@ -695,6 +695,7 @@ static int __net_init pm_nl_init_net(struct net *net)
 
 	INIT_LIST_HEAD_RCU(&pernet->addr_list);
 	__reset_counters(pernet);
+	pernet->next_id = 1;
 	spin_lock_init(&pernet->lock);
 	return 0;
 }
