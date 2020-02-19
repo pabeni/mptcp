@@ -15,147 +15,17 @@ static struct workqueue_struct *pm_wq;
 int mptcp_pm_announce_addr(struct mptcp_sock *msk,
 			   const struct mptcp_addr_info *addr)
 {
-	struct mptcp_sock *msk = mptcp_token_get_sock(token);
-	int err = 0;
+	pr_debug("msk=%p, local_id=%d", msk, addr->id);
 
-	if (!msk)
-		return -EINVAL;
-
-	if (msk->pm.local_valid) {
-		err = -EBADR;
-		goto announce_put;
-	}
-
-	pr_debug("msk=%p, local_id=%d", msk, local_id);
-	msk->pm.local_valid = 1;
-	msk->pm.local_id = local_id;
-	msk->pm.local_family = AF_INET;
-	msk->pm.local_addr = *addr;
-	msk->addr_signal = 1;
-
-announce_put:
-	sock_put((struct sock *)msk);
-	return err;
-}
-
-#if IS_ENABLED(CONFIG_MPTCP_IPV6)
-int mptcp_pm_announce_addr6(u32 token, u8 local_id, struct in6_addr *addr)
-{
-	struct mptcp_sock *msk = mptcp_token_get_sock(token);
-	int err = 0;
-
-	if (!msk)
-		return -EINVAL;
-
-	if (msk->pm.local_valid) {
-		err = -EBADR;
-		goto announce_put;
-	}
-
-	pr_debug("msk=%p, local_id=%d", msk, local_id);
-	msk->pm.local_valid = 1;
-	msk->pm.local_id = local_id;
-	msk->pm.local_family = AF_INET6;
-	msk->pm.local_addr6 = *addr;
-	msk->addr_signal = 1;
-
-announce_put:
-	sock_put((struct sock *)msk);
-	return err;
-}
-#endif
-
-int mptcp_pm_remove_addr(u32 token, u8 local_id)
-{
-	struct mptcp_sock *msk = mptcp_token_get_sock(token);
-
-	if (!msk)
-		return -EINVAL;
-
-	pr_debug("msk=%p", msk);
-	msk->pm.local_valid = 0;
-
-	sock_put((struct sock *)msk);
+	msk->pm.local = *addr;
+	WRITE_ONCE(msk->pm.addr_signal, true);
 	return 0;
 }
 
-int mptcp_pm_create_subflow(u32 token, u8 remote_id, struct in_addr *addr)
+int mptcp_pm_remove_addr(struct mptcp_sock *msk, u8 local_id)
 {
-	struct mptcp_sock *msk = mptcp_token_get_sock(token);
-	struct sockaddr_in remote;
-	struct sockaddr_in local;
-	struct sock *sk;
-	int err;
-
-	if (!msk)
-		return -EINVAL;
-
-	pr_debug("msk=%p", msk);
-
-	sk = (struct sock *)msk;
-	if (!msk->pm.remote_valid || remote_id != msk->pm.remote_id) {
-		err = -EBADR;
-		goto create_put;
-	}
-
-	local.sin_family = AF_INET;
-	local.sin_port = 0;
-	if (addr)
-		local.sin_addr = *addr;
-	else
-		local.sin_addr.s_addr = htonl(INADDR_ANY);
-
-	remote.sin_family = msk->pm.remote_family;
-	remote.sin_port = inet_sk(sk)->inet_dport;
-	remote.sin_addr = msk->pm.remote_addr;
-
-	err = mptcp_subflow_connect(sk, (struct sockaddr *)&local,
-				    (struct sockaddr *)&remote, remote_id);
-
-create_put:
-	sock_put(sk);
-	return err;
+	return -ENOTSUPP;
 }
-
-#if IS_ENABLED(CONFIG_MPTCP_IPV6)
-int mptcp_pm_create_subflow6(u32 token, u8 remote_id, struct in6_addr *addr)
-{
-	struct mptcp_sock *msk = mptcp_token_get_sock(token);
-	struct sockaddr_in6 remote;
-	struct sockaddr_in6 local;
-	struct sock *sk;
-	int err;
-
-	if (!msk)
-		return -EINVAL;
-
-	pr_debug("msk=%p", msk);
-	sk = (struct sock *)msk;
-
-	if (!msk->pm.remote_valid || remote_id != msk->pm.remote_id) {
-		err = -EBADR;
-		goto create_put;
-	}
-
-	local.sin6_family = AF_INET6;
-	local.sin6_port = 0;
-	if (addr)
-		local.sin6_addr = *addr;
-	else
-		local.sin6_addr = in6addr_any;
-
-	remote.sin6_family = msk->pm.remote_family;
-	remote.sin6_port = inet_sk(sk)->inet_dport;
-	remote.sin6_addr = msk->pm.remote_addr6;
-
-	err = mptcp_subflow_connect(sk, (struct sockaddr *)&local,
-				    (struct sockaddr *)&remote, remote_id);
-
-create_put:
-	sock_put(sk);
-	return err;
-}
-#endif
 
 int mptcp_pm_remove_subflow(struct mptcp_sock *msk, u8 remote_id)
 {
@@ -173,11 +43,36 @@ void mptcp_pm_new_connection(struct mptcp_sock *msk, int server_side)
 	WRITE_ONCE(pm->server_side, server_side);
 }
 
+static bool mptcp_pm_schedule_work(struct mptcp_sock *msk,
+				   enum mptcp_pm_status new_status)
+{
+	if (msk->pm.status != MPTCP_PM_IDLE)
+		return false;
+
+	if (queue_work(pm_wq, &msk->pm.work)) {
+		msk->pm.status = new_status;
+		sock_hold((struct sock *)msk);
+		return true;
+	}
+	return false;
+}
+
 void mptcp_pm_fully_established(struct mptcp_sock *msk)
 {
 	struct mptcp_pm_data *pm = &msk->pm;
 
 	pr_debug("msk=%p", msk);
+
+	/* try to avoid acquiring the lock below */
+	if (READ_ONCE(pm->fully_established))
+		return;
+
+	spin_lock_bh(&pm->lock);
+	if (!READ_ONCE(pm->fully_established) &&
+	    mptcp_pm_schedule_work(msk, MPTCP_PM_ESTABLISHED))
+		WRITE_ONCE(pm->fully_established, true);
+
+	spin_unlock_bh(&pm->lock);
 }
 
 void mptcp_pm_connection_closed(struct mptcp_sock *msk)
@@ -188,7 +83,19 @@ void mptcp_pm_connection_closed(struct mptcp_sock *msk)
 void mptcp_pm_subflow_established(struct mptcp_sock *msk,
 				  struct mptcp_subflow_context *subflow)
 {
+	struct mptcp_pm_data *pm = &msk->pm;
+
 	pr_debug("msk=%p", msk);
+
+	if (!READ_ONCE(pm->work_pending))
+		return;
+
+	spin_lock_bh(&pm->lock);
+
+	if (READ_ONCE(pm->work_pending))
+		mptcp_pm_schedule_work(msk, MPTCP_PM_SUBFLOW_ESTABLISHED);
+
+	spin_unlock_bh(&pm->lock);
 }
 
 void mptcp_pm_subflow_closed(struct mptcp_sock *msk, u8 id)
@@ -201,7 +108,21 @@ void mptcp_pm_add_addr(struct mptcp_sock *msk,
 {
 	struct mptcp_pm_data *pm = &msk->pm;
 
-	pr_debug("msk=%p, remote_id=%d", msk, addr->id);
+	pr_debug("msk=%p remote_id=%d accept=%d", msk, addr->id,
+		 READ_ONCE(pm->accept_addr));
+
+	/* avoid acquiring the lock if there is no room for fouther addresses */
+	if (!READ_ONCE(pm->accept_addr))
+		return;
+
+	spin_lock_bh(&pm->lock);
+
+	/* be sure there is something to signal re-checking under PM lock */
+	if (READ_ONCE(pm->accept_addr) &&
+	    mptcp_pm_schedule_work(msk, MPTCP_PM_ADD_ADDR))
+		pm->remote = *addr;
+
+	spin_unlock_bh(&pm->lock);
 }
 
 /* path manager helpers */
@@ -209,7 +130,24 @@ void mptcp_pm_add_addr(struct mptcp_sock *msk,
 bool mptcp_pm_addr_signal(struct mptcp_sock *msk, unsigned int remaining,
 			  struct mptcp_addr_info *saddr)
 {
-	return false;
+	int ret = false;
+
+	spin_lock_bh(&msk->pm.lock);
+
+	/* double check after the lock is acquired */
+	if (!mptcp_pm_should_signal(msk))
+		goto out_unlock;
+
+	if (remaining < mptcp_add_addr_len(msk->pm.local.family))
+		goto out_unlock;
+
+	*saddr = msk->pm.local;
+	WRITE_ONCE(msk->pm.addr_signal, false);
+	ret = true;
+
+out_unlock:
+	spin_unlock_bh(&msk->pm.lock);
+	return ret;
 }
 
 int mptcp_pm_get_local_id(struct mptcp_sock *msk, struct sock_common *skc)
@@ -219,6 +157,17 @@ int mptcp_pm_get_local_id(struct mptcp_sock *msk, struct sock_common *skc)
 
 static void pm_worker(struct work_struct *work)
 {
+	struct mptcp_pm_data *pm = container_of(work, struct mptcp_pm_data,
+						work);
+	struct mptcp_sock *msk = container_of(pm, struct mptcp_sock, pm);
+	struct sock *sk = (struct sock *)msk;
+
+	switch (READ_ONCE(pm->status)) {
+	default:
+		break;
+	}
+
+	sock_put(sk);
 }
 
 void mptcp_pm_data_init(struct mptcp_sock *msk)
