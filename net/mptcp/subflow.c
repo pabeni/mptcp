@@ -252,6 +252,7 @@ static void subflow_finish_connect(struct sock *sk, const struct sk_buff *skb)
 			goto do_reset;
 
 		subflow->conn_finished = 1;
+		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_JOINACKRX);
 	} else {
 do_reset:
 		tcp_send_active_reset(sk, GFP_ATOMIC);
@@ -374,8 +375,12 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
 		opt_rx.mptcp.mp_join = 0;
 		mptcp_get_options(skb, &opt_rx);
 		if (!opt_rx.mptcp.mp_join ||
-		    !subflow_hmac_valid(req, &opt_rx))
+		    !subflow_hmac_valid(req, &opt_rx)) {
+			SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINSYNACKMAC);
 			return NULL;
+		}
+
+		SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINSYNACKRX);
 	}
 
 create_child:
