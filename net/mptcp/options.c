@@ -717,7 +717,9 @@ static bool check_fully_established(struct mptcp_sock *msk, struct sock *sk,
 		goto fully_established;
 	}
 
-	WARN_ON_ONCE(subflow->can_ack);
+	if (WARN_ON_ONCE(subflow->can_ack))
+		printk(KERN_ERR "server side=%d dss=%d cap=%d seq_off=%d ssn=%d", msk->pm.server_side,
+		         mp_opt->dss, mp_opt->mp_capable, TCP_SKB_CB(skb)->seq - subflow->ssn_offset, subflow->ssn_offset);
 
 	/* If the first established packet does not contain MP_CAPABLE + data
 	 * then fallback to TCP

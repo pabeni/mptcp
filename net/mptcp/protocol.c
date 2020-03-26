@@ -234,8 +234,12 @@ static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
 			seq += len;
 			moved += len;
 
-			if (WARN_ON_ONCE(map_remaining < len))
+			if (WARN_ON_ONCE(map_remaining < len)) {
+				printk(KERN_ERR "map_remaining: %d len %ld copied_seq=%d offset=%d map len=%d map_seq=%d ssn offset=%d ssn delta=%d",
+				         map_remaining, len, seq, offset, subflow->map_data_len,
+				         subflow->map_subflow_seq, subflow->ssn_offset, seq - subflow->ssn_offset);
 				break;
+			}
 		} else {
 			WARN_ON_ONCE(!fin);
 			sk_eat_skb(ssk, skb);
