@@ -718,8 +718,11 @@ static bool check_fully_established(struct mptcp_sock *msk, struct sock *sk,
 	}
 
 	if (WARN_ON_ONCE(subflow->can_ack))
-		printk(KERN_ERR "server side=%d dss=%d cap=%d seq_off=%d ssn=%d", msk->pm.server_side,
-		         mp_opt->dss, mp_opt->mp_capable, TCP_SKB_CB(skb)->seq - subflow->ssn_offset, subflow->ssn_offset);
+		printk(KERN_ERR "server side=%d port=%d:%d syn=%d dss=%d cap=%d cap_data=%d data_len=%d seq_off=%d ssn=%d len=%d",
+		       msk->pm.server_side, ntohs(tcp_hdr(skb)->source), ntohs(tcp_hdr(skb)->dest),
+		       tcp_hdr(skb)->syn, mp_opt->dss, mp_opt->mp_capable,
+		       mp_opt->mpc_map, mp_opt->data_len, TCP_SKB_CB(skb)->seq - subflow->ssn_offset,
+		       subflow->ssn_offset, skb->len);
 
 	/* If the first established packet does not contain MP_CAPABLE + data
 	 * then fallback to TCP

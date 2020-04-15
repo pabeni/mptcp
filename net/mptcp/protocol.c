@@ -1329,6 +1329,7 @@ static void mptcp_copy_inaddrs(struct sock *msk, const struct sock *ssk)
 
 static int mptcp_disconnect(struct sock *sk, int flags)
 {
+	pr_crit_ratelimited("mptcp_disconnect flags %x\n", flags);
 	lock_sock(sk);
 	__mptcp_clear_xmit(sk);
 	release_sock(sk);
