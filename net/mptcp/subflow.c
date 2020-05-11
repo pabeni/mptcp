@@ -500,6 +500,7 @@ create_child:
 			ctx->remote_key = mp_opt.sndr_key;
 			ctx->fully_established = mp_opt.mp_capable;
 			ctx->can_ack = mp_opt.mp_capable;
+			tcp_sk(child)->drop_req = false;
 		} else if (ctx->mp_join) {
 			struct mptcp_sock *owner;
 
@@ -512,6 +513,7 @@ create_child:
 				goto close_child;
 
 			SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINACKRX);
+			tcp_sk(child)->drop_req = true;
 		}
 	}
 

@@ -385,6 +385,7 @@ struct tcp_sock {
 			   */
 #if IS_ENABLED(CONFIG_MPTCP)
 	bool	is_mptcp;
+	bool	drop_req;
 #endif
 
 #ifdef CONFIG_TCP_MD5SIG
