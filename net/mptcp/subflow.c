@@ -423,8 +423,11 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
 	subflow_req = mptcp_subflow_rsk(req);
 	fallback_is_fatal = tcp_rsk(req)->is_mptcp && subflow_req->mp_join;
 	fallback = !tcp_rsk(req)->is_mptcp;
-	if (fallback)
+	if (fallback) {
+		if (fallback_is_fatal)
+			goto dispose_req;
 		goto create_child;
+	}
 
 	/* if the sk is MP_CAPABLE, we try to fetch the client key */
 	if (subflow_req->mp_capable) {
@@ -452,7 +455,7 @@ create_msk:
 		    !mptcp_can_accept_new_subflow(subflow_req->msk) ||
 		    !subflow_hmac_valid(req, &mp_opt)) {
 			SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINACKMAC);
-			fallback = true;
+			goto dispose_req;
 		}
 	}
 
@@ -528,15 +531,24 @@ out:
 		      !mptcp_subflow_ctx(child)->conn));
 	return child;
 
+dispose_req:
+	/* The last req reference will be released by the caller */
+	child = NULL;
+	*own_req = false;
+	inet_csk_reqsk_queue_drop((struct sock *)sk, req);
+	goto reset;
+
 dispose_child:
+	/* The last child reference will be released by the caller */
 	subflow_drop_ctx(child);
 	tcp_rsk(req)->drop_req = true;
 	inet_csk_prepare_for_destroy_sock(child);
 	tcp_done(child);
-	req->rsk_ops->send_reset(sk, skb);
 
-	/* The last child reference will be released by the caller */
+reset:
+	req->rsk_ops->send_reset(sk, skb);
 	return child;
+
 }
 
 static struct inet_connection_sock_af_ops subflow_specific;
