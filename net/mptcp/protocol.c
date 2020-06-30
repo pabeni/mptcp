@@ -808,39 +808,106 @@ static void mptcp_nospace(struct mptcp_sock *msk, struct socket *sock)
 	set_bit(SOCK_NOSPACE, &sock->flags);
 }
 
+static bool mptcp_subflow_active(struct mptcp_subflow_context *subflow,
+				 bool fallback)
+{
+	struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+
+	/* subflow must be open for write */
+	if ((1 << ssk->sk_state) &
+	    (TCPF_CLOSE | TCPF_LAST_ACK | TCPF_CLOSING | TCPF_FIN_WAIT2 |
+	     TCPF_FIN_WAIT1))
+		return false;
+
+	/* we can xmit on MPC and fallen back subflows in
+	 * TCP_SYN_SENT/TCP_SYN_RECV status, but we need fully established
+	 * MP_JOIN subflows.
+	 */
+	return !subflow->request_join ||
+	       (subflow->fully_established && !fallback);
+}
+
+#define MPTCP_SEND_BURST_SIZE		(1 << 15)
+
+static struct list_head *mptcp_next_subflow(struct mptcp_sock *msk,
+					    struct list_head *pos,
+					    bool wrap_around)
+{
+	if (list_is_last(pos, &msk->conn_list) && wrap_around)
+		return msk->conn_list.next;
+	return pos->next;
+}
+
 static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
 {
+	int next_wspace = 0, next_bu_wspace = 0, last_snd_wspace = 0;
+	bool fallback = __mptcp_check_fallback(msk);
 	struct mptcp_subflow_context *subflow;
-	struct sock *backup = NULL;
+	struct sock *next_backup = NULL;
+	struct list_head *pos, *start;
+	struct sock *next_ssk = NULL;
+	bool wrap_around;
 
 	sock_owned_by_me((const struct sock *)msk);
 
 	if (!mptcp_ext_cache_refill(msk))
 		return NULL;
 
-	mptcp_for_each_subflow(msk, subflow) {
-		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
-
-		if (!sk_stream_memory_free(ssk)) {
-			struct socket *sock = ssk->sk_socket;
-
-			if (sock)
-				mptcp_nospace(msk, sock);
-
-			return NULL;
-		}
-
-		if (subflow->backup) {
-			if (!backup)
-				backup = ssk;
-
-			continue;
-		}
-
-		return ssk;
+	/* lookup the first writeable subflow and first writable back subflow
+	 * starting from last used, with wrap-around
+	 */
+	if (msk->last_snd) {
+		start = &mptcp_subflow_ctx(msk->last_snd)->node;
+		wrap_around = true;
+	} else {
+		start = &msk->conn_list;
+		wrap_around = false;
 	}
+	pr_debug("msk=%p start=%p pos=%p wrap_around=%d last=%p", msk, start,
+		 mptcp_next_subflow(msk, start, wrap_around), wrap_around,
+		 msk->last_snd);
+	for (pos = mptcp_next_subflow(msk, start, wrap_around); pos != start;
+	     pos = mptcp_next_subflow(msk, pos, wrap_around)) {
+		struct sock *ssk;
+		int wspace;
 
-	return backup;
+		subflow = list_entry(pos, struct mptcp_subflow_context, node);
+		ssk =  mptcp_subflow_tcp_sock(subflow);
+		if (!mptcp_subflow_active(subflow, fallback))
+			continue;
+
+		wspace = sk_stream_wspace(ssk);
+		if (wspace <= 0)
+			continue;
+
+		if (!subflow->backup && !next_ssk) {
+			next_ssk = ssk;
+			next_wspace = wspace;
+		}
+
+		if (subflow->backup && !next_backup) {
+			next_backup = ssk;
+			next_bu_wspace = wspace;
+		}
+	}
+	if (!next_ssk) {
+		next_ssk = next_backup;
+		next_wspace = next_bu_wspace;
+	}
+	last_snd_wspace = msk->last_snd ? sk_stream_wspace(msk->last_snd) : 0;
+	pr_debug("msk=%p ssk=%p last=%p wspace=%d last wspace=%d burst=%d", msk,
+		 next_ssk, msk->last_snd, next_wspace, last_snd_wspace,
+		 msk->snd_burst);
+
+	/* use the looked-up subflow if the previusly used has exauted the burst
+	 * or is not writable
+	 */
+	if (next_ssk && (last_snd_wspace <= 0 || msk->snd_burst <= 0)) {
+		msk->last_snd = next_ssk;
+		msk->snd_burst = min(MPTCP_SEND_BURST_SIZE, next_wspace);
+		last_snd_wspace = next_wspace;
+	}
+	return last_snd_wspace > 0 ? msk->last_snd : NULL;
 }
 
 static void ssk_check_wmem(struct mptcp_sock *msk, struct sock *ssk)
@@ -936,6 +1003,7 @@ wait_for_sndbuf:
 		}
 
 		copied += ret;
+		msk->snd_burst -= ret;
 
 		tx_ok = msg_data_left(msg);
 		if (!tx_ok)
@@ -1152,6 +1220,10 @@ static bool __mptcp_move_skbs(struct mptcp_sock *msk)
 	unsigned int moved = 0;
 	bool done;
 
+	if (((struct sock *)msk)->sk_state == TCP_CLOSE)
+		return false;
+
+	__mptcp_flush_join_list(msk);
 	do {
 		struct sock *ssk = mptcp_subflow_recv_lookup(msk);
 
@@ -1304,6 +1376,7 @@ static void mptcp_retransmit_timer(struct timer_list *t)
  */
 static struct sock *mptcp_subflow_get_retrans(const struct mptcp_sock *msk)
 {
+	bool fallback = __mptcp_check_fallback(msk);
 	struct mptcp_subflow_context *subflow;
 	struct sock *backup = NULL;
 
@@ -1311,6 +1384,9 @@ static struct sock *mptcp_subflow_get_retrans(const struct mptcp_sock *msk)
 
 	mptcp_for_each_subflow(msk, subflow) {
 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+
+		if (!mptcp_subflow_active(subflow, fallback))
+			continue;
 
 		/* still data outstanding at TCP level?  Don't retransmit. */
 		if (!tcp_write_queue_empty(ssk))
