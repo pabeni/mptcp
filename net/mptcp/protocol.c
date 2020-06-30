@@ -674,10 +674,33 @@ static void mptcp_nospace(struct mptcp_sock *msk, struct socket *sock)
 	set_bit(SOCK_NOSPACE, &sock->flags);
 }
 
+static bool mptcp_subflow_active(struct mptcp_subflow_context *subflow,
+				 bool fallback)
+{
+	struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+
+	/* subflow must be open for write */
+	if ((1 << ssk->sk_state) &
+	    (TCPF_CLOSE | TCPF_LAST_ACK | TCPF_CLOSING | TCPF_FIN_WAIT2 |
+	     TCPF_FIN_WAIT1))
+		return false;
+
+	/* we can xmit on MPC and fallen back subflows in
+	 * TCP_SYN_SENT/TCP_SYN_RECV status, but we need fully established
+	 * MP_JOIN subflows.
+	 */
+	return !subflow->request_join ||
+	       (subflow->fully_established && !fallback);
+}
+
 static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
 {
+	bool fallback = __mptcp_check_fallback(msk);
 	struct mptcp_subflow_context *subflow;
+	struct sock *best_ssk = NULL;
 	struct sock *backup = NULL;
+	int backup_wspace = 0;
+	int best_wspace = 0;
 
 	sock_owned_by_me((const struct sock *)msk);
 
@@ -686,27 +709,26 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
 
 	mptcp_for_each_subflow(msk, subflow) {
 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+		int wspace;
 
-		if (!sk_stream_memory_free(ssk)) {
-			struct socket *sock = ssk->sk_socket;
-
-			if (sock)
-				mptcp_nospace(msk, sock);
-
-			return NULL;
-		}
-
-		if (subflow->backup) {
-			if (!backup)
-				backup = ssk;
-
+		if (!mptcp_subflow_active(subflow, fallback))
 			continue;
-		}
 
-		return ssk;
+		wspace = sk_stream_wspace(ssk);
+		if (subflow->backup) {
+			if (!backup || wspace > backup_wspace) {
+				backup = ssk;
+				backup_wspace = wspace;
+			}
+		} else {
+			if (!best_ssk || wspace > best_wspace) {
+				best_ssk = ssk;
+				best_wspace = wspace;
+			}
+		}
 	}
 
-	return backup;
+	return best_ssk ? : backup;
 }
 
 static void ssk_check_wmem(struct mptcp_sock *msk, struct sock *ssk)
