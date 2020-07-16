@@ -55,7 +55,7 @@ static void subflow_generate_hmac(u64 key1, u64 key2, u32 nonce1, u32 nonce2,
 
 static bool mptcp_can_accept_new_subflow(const struct mptcp_sock *msk)
 {
-	return inet_sk_state_load((struct sock *)msk) == TCP_ESTABLISHED &&
+	return mptcp_is_fully_established((void *)msk) &&
 	       READ_ONCE(msk->pm.accept_subflow);
 }
 
