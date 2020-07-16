@@ -709,6 +709,7 @@ static bool check_fully_established(struct mptcp_sock *msk, struct sock *sk,
 		 * additional ack.
 		 */
 		subflow->fully_established = 1;
+		WRITE_ONCE(msk->fully_established, true);
 		goto fully_established;
 	}
 

@@ -1522,6 +1522,7 @@ struct sock *mptcp_sk_clone(const struct sock *sk,
 	msk->local_key = subflow_req->local_key;
 	msk->token = subflow_req->token;
 	msk->subflow = NULL;
+	WRITE_ONCE(msk->fully_established, false);
 
 	msk->write_seq = subflow_req->idsn + 1;
 	atomic64_set(&msk->snd_una, msk->write_seq);
@@ -1854,7 +1855,7 @@ bool mptcp_finish_join(struct sock *sk)
 	pr_debug("msk=%p, subflow=%p", msk, subflow);
 
 	/* mptcp socket already closing? */
-	if (inet_sk_state_load(parent) != TCP_ESTABLISHED)
+	if (!mptcp_is_fully_established(parent))
 		return false;
 
 	if (!msk->pm.server_side)

@@ -395,9 +395,7 @@ void mptcp_subflow_fully_established(struct mptcp_subflow_context *subflow,
 	subflow->remote_key = mp_opt->sndr_key;
 	subflow->fully_established = 1;
 	subflow->can_ack = 1;
-
-	inet_sk_state_store(subflow->conn, TCP_ESTABLISHED);
-	mptcp_pm_new_connection(msk, 1);
+	WRITE_ONCE(msk->fully_established, true);
 }
 
 static struct sock *subflow_syn_recv_sock(const struct sock *sk,
@@ -479,10 +477,16 @@ create_child:
 		}
 
 		if (ctx->mp_capable) {
+			/* this can't race with mptcp_close(), as the msk is
+			 * not yet exposted to user-space
+			 */
+			inet_sk_state_store((void *)new_msk, TCP_ESTABLISHED);
+
 			/* new mpc subflow takes ownership of the newly
 			 * created mptcp socket
 			 */
 			new_msk->sk_destruct = mptcp_sock_destruct;
+			mptcp_pm_new_connection(mptcp_sk(new_msk), 1);
 			mptcp_token_accept(subflow_req, mptcp_sk(new_msk));
 			ctx->conn = new_msk;
 			new_msk = NULL;
@@ -977,7 +981,7 @@ int __mptcp_subflow_connect(struct sock *sk, int ifindex,
 	int addrlen;
 	int err;
 
-	if (sk->sk_state != TCP_ESTABLISHED)
+	if (!mptcp_is_fully_established(sk))
 		return -ENOTCONN;
 
 	err = mptcp_subflow_create_socket(sk, &sf);
