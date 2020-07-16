@@ -160,7 +160,8 @@ static bool mptcp_subflow_dsn_valid(const struct mptcp_sock *msk,
 		return true;
 
 	subflow->data_avail = 0;
-	return mptcp_subflow_data_available(ssk);
+	mptcp_subflow_data_available(ssk);
+	return subflow->data_avail == MPTCP_SUBFLOW_DATA_AVAIL;
 }
 
 static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
@@ -173,6 +174,11 @@ static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
 	bool more_data_avail;
 	struct tcp_sock *tp;
 	bool done = false;
+
+	if (subflow->data_avail == MPTCP_SUBFLOW_OOO_DATA) {
+		mptcp_subflow_discard_data(ssk, subflow->map_data_len);
+		return false;
+	}
 
 	if (!mptcp_subflow_dsn_valid(msk, ssk)) {
 		*bytes = 0;
@@ -267,9 +273,11 @@ static bool move_skbs_to_msk(struct mptcp_sock *msk, struct sock *ssk)
 
 void mptcp_data_ready(struct sock *sk, struct sock *ssk)
 {
+	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
 	struct mptcp_sock *msk = mptcp_sk(sk);
 
-	set_bit(MPTCP_DATA_READY, &msk->flags);
+	if (subflow->data_avail == MPTCP_SUBFLOW_DATA_AVAIL)
+		set_bit(MPTCP_DATA_READY, &msk->flags);
 
 	if (atomic_read(&sk->sk_rmem_alloc) < READ_ONCE(sk->sk_rcvbuf) &&
 	    move_skbs_to_msk(msk, ssk))
@@ -290,7 +298,8 @@ void mptcp_data_ready(struct sock *sk, struct sock *ssk)
 		move_skbs_to_msk(msk, ssk);
 	}
 wake:
-	sk->sk_data_ready(sk);
+	if (subflow->data_avail == MPTCP_SUBFLOW_DATA_AVAIL)
+		sk->sk_data_ready(sk);
 }
 
 static void __mptcp_flush_join_list(struct mptcp_sock *msk)
