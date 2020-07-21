@@ -1220,6 +1220,10 @@ static bool __mptcp_move_skbs(struct mptcp_sock *msk)
 	unsigned int moved = 0;
 	bool done;
 
+	if (((struct sock *)msk)->sk_state == TCP_CLOSE)
+		return false;
+
+	__mptcp_flush_join_list(msk);
 	do {
 		struct sock *ssk = mptcp_subflow_recv_lookup(msk);
 
