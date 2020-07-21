@@ -129,9 +129,9 @@ static bool mptcp_try_coalesce(struct sock *sk, struct sk_buff *to,
 	    !skb_try_coalesce(to, from, &fragstolen, &delta))
 		return false;
 
-	pr_debug("colesced seq %llx into %llx new len %d new end seq %llx",
+	pr_debug("colesced seq %llx into %llx new len %d offset %d new end seq %llx",
 		 MPTCP_SKB_CB(from)->map_seq, MPTCP_SKB_CB(to)->map_seq,
-		 to->len, MPTCP_SKB_CB(from)->end_seq);
+		 to->len, MPTCP_SKB_CB(to)->offset, MPTCP_SKB_CB(from)->end_seq);
 	MPTCP_SKB_CB(to)->end_seq = MPTCP_SKB_CB(from)->end_seq;
 	kfree_skb_partial(from, fragstolen);
 	atomic_add(delta, &sk->sk_rmem_alloc);
@@ -164,7 +164,8 @@ static void mptcp_data_queue_ofo(struct mptcp_sock *msk, struct sk_buff *skb)
 	max_seq = tcp_space(sk);
 	max_seq = max_seq > 0 ? max_seq + msk->ack_seq: msk->ack_seq;
 
-	pr_debug("msk=%p seq=%llx limit=%llx empty=%d", msk, seq, max_seq,
+	pr_debug("msk=%p seq=%llx end_seq %llx len %d limit=%llx empty=%d", msk, seq,
+	         end_seq, skb->len, max_seq,
 		 RB_EMPTY_ROOT(&msk->out_of_order_queue));
 	if (after64(seq, max_seq)) {
 		/* out of window */
@@ -284,6 +285,9 @@ static bool __mptcp_move_skb(struct mptcp_sock *msk, struct sock *ssk,
 
 	if (MPTCP_SKB_CB(skb)->map_seq == msk->ack_seq) {
 		/* in sequence */
+		pr_debug("in order seq %llx len %d offset %d ack_seq %llx -> %llx",
+		         MPTCP_SKB_CB(skb)->map_seq, skb->len, MPTCP_SKB_CB(skb)->offset,
+		         msk->ack_seq, msk->ack_seq + copy_len);
 		msk->ack_seq += copy_len;
 		tail = skb_peek_tail(&sk->sk_receive_queue);
 		if (tail && mptcp_try_coalesce(sk, tail, skb))
@@ -388,7 +392,8 @@ static bool mptcp_ofo_queue(struct mptcp_sock *msk)
 	u64 end_seq;
 
 	p = rb_first(&msk->out_of_order_queue);
-	pr_debug("msk=%p empty=%d", msk, RB_EMPTY_ROOT(&msk->out_of_order_queue));
+	pr_debug("msk=%p ack_seq=%llx skb seq=%llx empty=%d", msk, msk->ack_seq,
+	         p ? MPTCP_SKB_CB(rb_to_skb(p))->map_seq: 0, RB_EMPTY_ROOT(&msk->out_of_order_queue));
 	while (p) {
 		skb = rb_to_skb(p);
 		if (after64(MPTCP_SKB_CB(skb)->map_seq, msk->ack_seq))
@@ -399,20 +404,26 @@ static bool mptcp_ofo_queue(struct mptcp_sock *msk)
 
 		if (unlikely(!after64(MPTCP_SKB_CB(skb)->end_seq,
 				      msk->ack_seq))) {
+			pr_debug("dropping skb seq %llx end seq %llx ack_seq %llx",
+			         MPTCP_SKB_CB(skb)->map_seq, MPTCP_SKB_CB(skb)->end_seq,
+			         msk->ack_seq);
 			mptcp_drop(sk, skb);
 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_DUPDATA);
 			continue;
 		}
 
+		pr_debug("moving ooo skb seq %llx end seq %llx into receive queue ack_seq %llx",
+		         MPTCP_SKB_CB(skb)->map_seq, MPTCP_SKB_CB(skb)->end_seq,
+		         msk->ack_seq);
 		end_seq = MPTCP_SKB_CB(skb)->end_seq;
 		tail = skb_peek_tail(&sk->sk_receive_queue);
 		if (!tail || !mptcp_ooo_try_coalesce(msk, tail, skb)) {
 			int delta = msk->ack_seq - MPTCP_SKB_CB(skb)->map_seq;
 
 			/* skip overlapping data, if any */
-			pr_debug("uncoalesced seq=%llx ack seq=%llx delta=%d",
+			pr_debug("uncoalesced seq=%llx ack seq=%llx delta=%d offset=%d len=%d",
 				 MPTCP_SKB_CB(skb)->map_seq, msk->ack_seq,
-				 delta);
+				 delta, MPTCP_SKB_CB(skb)->offset, skb->len);
 			MPTCP_SKB_CB(skb)->offset += delta;
 			__skb_queue_tail(&sk->sk_receive_queue, skb);
 		}
@@ -837,7 +848,7 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 	mpext->use_map = 1;
 	mpext->dsn64 = 1;
 
-	pr_debug("data_seq=%llu subflow_seq=%u data_len=%u dsn64=%d",
+	pr_debug("data_seq=%llx subflow_seq=%u data_len=%u dsn64=%d",
 		 mpext->data_seq, mpext->subflow_seq, mpext->data_len,
 		 mpext->dsn64);
 
@@ -1242,14 +1253,18 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 			 int nonblock, int flags, int *addr_len)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
+	struct mptcp_subflow_context *subflow;
 	int copied = 0;
 	int target;
 	long timeo;
+	bool old;
 
 	if (msg->msg_flags & ~(MSG_WAITALL | MSG_DONTWAIT))
 		return -EOPNOTSUPP;
 
 	lock_sock(sk);
+	old = test_bit(MPTCP_DATA_READY, &msk->flags);
+
 	timeo = sock_rcvtimeo(sk, nonblock);
 
 	len = min_t(size_t, len, INT_MAX);
@@ -1332,6 +1347,21 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 	}
 out_err:
 	mptcp_rcv_space_adjust(msk, copied);
+	if (copied == 0) {
+		pr_warn("msk=%p old data ready %d new data ready %d receive queue empty %d "
+		        "ack_seq=%llx state=%d server side=%d join list empty=%d",
+		        msk, old, test_bit(MPTCP_DATA_READY, &msk->flags), skb_queue_empty(&sk->sk_receive_queue),
+		        msk->ack_seq, sk->sk_state, msk->pm.server_side, list_empty(&msk->join_list));
+		mptcp_for_each_subflow(msk, subflow) {
+			pr_warn("subflow=%p map=%d:%llx:%d data_avail=%d copied seq=%d rel_write_seq=%d state=%d",
+			        subflow, subflow->map_valid, mptcp_subflow_get_mapped_dsn(subflow),
+			        subflow->map_subflow_seq, subflow->data_avail,
+			        tcp_sk(mptcp_subflow_tcp_sock(subflow))->copied_seq - subflow->ssn_offset,
+			        subflow->rel_write_seq, mptcp_subflow_tcp_sock(subflow)->sk_state);
+		}
+	}
+	mptcp_for_each_subflow(msk, subflow)
+		pr_debug("msk=%p subflow=%p", msk, subflow);
 
 	release_sock(sk);
 	return copied;
