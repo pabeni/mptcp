@@ -988,6 +988,10 @@ static void subflow_write_space(struct sock *sk)
 		return;
 
 	WRITE_ONCE(subflow->writable, true);
+	pr_debug("msk=%p writable=%d:%d:%d ssk=%p:%d:%d sock=%lx", parent,
+		sk_stream_is_writeable(parent), sk_stream_min_wspace(parent),
+		parent->sk_sndbuf, sk, sk_stream_memory_free(sk), subflow->writable,
+		(long)sk->sk_socket);
 	if (sk_stream_is_writeable(parent)) {
 		set_bit(MPTCP_SEND_SPACE, &mptcp_sk(parent)->flags);
 		smp_mb__after_atomic();
@@ -1109,6 +1113,7 @@ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
 	if (err && err != -EINPROGRESS)
 		goto failed;
 
+	pr_warn("msk=%p subflow=%p", msk, subflow);
 	spin_lock_bh(&msk->join_list_lock);
 	list_add_tail(&subflow->node, &msk->join_list);
 	spin_unlock_bh(&msk->join_list_lock);
