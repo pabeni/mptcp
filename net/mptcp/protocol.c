@@ -855,7 +855,8 @@ static struct list_head *mptcp_next_subflow(struct mptcp_sock *msk,
 	return pos->next;
 }
 
-static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
+static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk,
+					   u32 *snd_wnd)
 {
 	int next_wspace = 0, next_bu_wspace = 0, last_snd_wspace = 0;
 	bool fallback = __mptcp_check_fallback(msk);
@@ -867,6 +868,7 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
 
 	sock_owned_by_me((const struct sock *)msk);
 
+	*snd_wnd = 0;
 	if (!mptcp_ext_cache_refill(msk))
 		return NULL;
 
@@ -893,6 +895,7 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
 		if (!mptcp_subflow_active(subflow, fallback))
 			continue;
 
+		*snd_wnd = max(tcp_sk(ssk)->snd_wnd, *snd_wnd);
 		wspace = sk_stream_wspace(ssk);
 		if (wspace <= 0)
 			continue;
@@ -911,7 +914,10 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
 		next_ssk = next_backup;
 		next_wspace = next_bu_wspace;
 	}
-	last_snd_wspace = msk->last_snd ? sk_stream_wspace(msk->last_snd) : 0;
+	if (msk->last_snd) {
+		last_snd_wspace = sk_stream_wspace(msk->last_snd);
+		*snd_wnd = max(tcp_sk(msk->last_snd)->snd_wnd, *snd_wnd);
+	}
 	pr_debug("msk=%p ssk=%p last=%p wspace=%d last wspace=%d burst=%d", msk,
 		 next_ssk, msk->last_snd, next_wspace, last_snd_wspace,
 		 msk->snd_burst);
@@ -946,6 +952,7 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	struct page_frag *pfrag;
 	size_t copied = 0;
 	struct sock *ssk;
+	u32 snd_wnd;
 	bool tx_ok;
 	long timeo;
 
@@ -973,7 +980,7 @@ restart:
 
 wait_for_sndbuf:
 	__mptcp_flush_join_list(msk);
-	ssk = mptcp_subflow_get_send(msk);
+	ssk = mptcp_subflow_get_send(msk, &snd_wnd);
 	while (!sk_stream_memory_free(sk) ||
 	       !ssk ||
 	       !mptcp_page_frag_refill(ssk, pfrag)) {
@@ -996,12 +1003,17 @@ wait_for_sndbuf:
 
 		mptcp_clean_una(sk);
 
-		ssk = mptcp_subflow_get_send(msk);
+		ssk = mptcp_subflow_get_send(msk, &snd_wnd);
 		if (list_empty(&msk->conn_list)) {
 			ret = -ENOTCONN;
 			goto out;
 		}
 	}
+
+	/* do auto tuning */
+	if (!(sk->sk_userlocks & SOCK_RCVBUF_LOCK) &&
+	    snd_wnd > READ_ONCE(sk->sk_sndbuf))
+		WRITE_ONCE(sk->sk_sndbuf, snd_wnd);
 
 	pr_debug("conn_list->subflow=%p", ssk);
 
@@ -1603,7 +1615,7 @@ static int mptcp_init_sock(struct sock *sk)
 
 	sk_sockets_allocated_inc(sk);
 	sk->sk_rcvbuf = sock_net(sk)->ipv4.sysctl_tcp_rmem[1];
-	sk->sk_sndbuf = sock_net(sk)->ipv4.sysctl_tcp_wmem[2];
+	sk->sk_sndbuf = sock_net(sk)->ipv4.sysctl_tcp_wmem[1];
 
 	return 0;
 }
