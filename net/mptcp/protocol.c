@@ -1032,13 +1032,18 @@ out:
 	return ret;
 }
 
-static void mptcp_nospace(struct mptcp_sock *msk, struct socket *sock)
+static void mptcp_nospace(struct sock *sk, struct sock *ssk)
 {
+	struct mptcp_sock *msk = mptcp_sk(sk);
+	struct socket *sock;
+
 	clear_bit(MPTCP_SEND_SPACE, &msk->flags);
 	smp_mb__after_atomic(); /* msk->flags is changed by write_space cb */
 
 	/* enables sk->write_space() callbacks */
-	set_bit(SOCK_NOSPACE, &sock->flags);
+	sock = READ_ONCE(ssk->sk_socket);
+	if (sock)
+		set_bit(SOCK_NOSPACE, &sock->flags);
 }
 
 static bool mptcp_subflow_active(struct mptcp_subflow_context *subflow,
@@ -1149,16 +1154,14 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk,
 	return last_snd_wspace > 0 ? msk->last_snd : NULL;
 }
 
-static void ssk_check_wmem(struct mptcp_sock *msk, struct sock *ssk)
+static void ssk_check_wmem(struct sock *sk, struct sock *ssk)
 {
-	struct socket *sock;
-
-	if (likely(sk_stream_is_writeable(ssk)))
+	pr_debug("msk=%p writable=%d:%d:%d", sk, sk_stream_is_writeable(sk),
+		 sk_stream_min_wspace(sk), sk->sk_sndbuf);
+	if (likely(sk_stream_is_writeable(sk)))
 		return;
 
-	sock = READ_ONCE(ssk->sk_socket);
-	if (sock)
-		mptcp_nospace(msk, sock);
+	mptcp_nospace(sk, ssk);
 }
 
 static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
@@ -1197,6 +1200,10 @@ restart:
 wait_for_sndbuf:
 	__mptcp_flush_join_list(msk);
 	ssk = mptcp_subflow_get_send(msk, &snd_wnd);
+	pr_debug("msk=%p snd_wnd=%d free=%d:%d:%d ssk=%p",
+	         msk, snd_wnd, sk_stream_memory_free(sk),
+	         READ_ONCE(sk->sk_wmem_queued), READ_ONCE(sk->sk_sndbuf),
+	         ssk);
 	while (!sk_stream_memory_free(sk) ||
 	       !ssk ||
 	       !mptcp_page_frag_refill(ssk, pfrag)) {
@@ -1231,7 +1238,7 @@ wait_for_sndbuf:
 	    snd_wnd > READ_ONCE(sk->sk_sndbuf))
 		WRITE_ONCE(sk->sk_sndbuf, snd_wnd);
 
-	pr_debug("conn_list->subflow=%p", ssk);
+	pr_debug("conn_list->subflow=%p cwnd=%d", ssk, snd_wnd);
 
 	lock_sock(ssk);
 	tx_ok = msg_data_left(msg);
@@ -1289,6 +1296,7 @@ wait_for_sndbuf:
 				 * Wakeup will happen via mptcp_clean_una().
 				 */
 				mptcp_set_timeout(sk, ssk);
+				mptcp_nospace(sk, ssk);
 				release_sock(ssk);
 				goto wait_for_sndbuf;
 			}
@@ -1306,7 +1314,7 @@ wait_for_sndbuf:
 			mptcp_reset_timer(sk);
 	}
 
-	ssk_check_wmem(msk, ssk);
+	ssk_check_wmem(sk, ssk);
 	release_sock(ssk);
 out:
 	release_sock(sk);
