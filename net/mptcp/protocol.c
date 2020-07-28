@@ -1042,6 +1042,7 @@ static void mptcp_nospace(struct sock *sk, struct sock *ssk)
 
 	/* enables sk->write_space() callbacks */
 	sock = READ_ONCE(ssk->sk_socket);
+	pr_debug("msk=%p ssk=%p sock=%lx", sk, ssk, (long)sock);
 	if (sock)
 		set_bit(SOCK_NOSPACE, &sock->flags);
 }

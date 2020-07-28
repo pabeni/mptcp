@@ -905,10 +905,9 @@ static void subflow_write_space(struct sock *sk)
 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
 	struct sock *parent = subflow->conn;
 
-	pr_debug("msk=%p writable=%d:%d:%d", parent,
+	pr_debug("msk=%p writable=%d:%d:%d ssk=%p sock=%lx", parent,
 		sk_stream_is_writeable(parent), sk_stream_min_wspace(parent),
-		parent->sk_sndbuf);
-	sk_stream_write_space(sk);
+		parent->sk_sndbuf, sk, (long)sk->sk_socket);
 	if (sk_stream_is_writeable(parent)) {
 		set_bit(MPTCP_SEND_SPACE, &mptcp_sk(parent)->flags);
 		smp_mb__after_atomic();
