@@ -1156,8 +1156,6 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk,
 
 static void ssk_check_wmem(struct sock *sk, struct sock *ssk)
 {
-	pr_debug("msk=%p writable=%d:%d:%d", sk, sk_stream_is_writeable(sk),
-		 sk_stream_min_wspace(sk), sk->sk_sndbuf);
 	if (likely(sk_stream_is_writeable(sk)))
 		return;
 
@@ -1298,6 +1296,9 @@ wait_for_sndbuf:
 				mptcp_set_timeout(sk, ssk);
 				mptcp_nospace(sk, ssk);
 				release_sock(ssk);
+				pr_debug("msk=%p writable=%d:%d:%d copied=%ld ret=%d", sk,
+					 sk_stream_is_writeable(sk), sk_stream_min_wspace(sk),
+					 sk->sk_sndbuf, copied, ret);
 				goto wait_for_sndbuf;
 			}
 		}
@@ -1305,7 +1306,6 @@ wait_for_sndbuf:
 
 	mptcp_set_timeout(sk, ssk);
 	if (copied) {
-		ret = copied;
 		tcp_push(ssk, msg->msg_flags, mss_now, tcp_sk(ssk)->nonagle,
 			 size_goal);
 
@@ -1317,8 +1317,11 @@ wait_for_sndbuf:
 	ssk_check_wmem(sk, ssk);
 	release_sock(ssk);
 out:
+	pr_debug("msk=%p writable=%d:%d:%d copied=%ld ret=%d", sk,
+		 sk_stream_is_writeable(sk), sk_stream_min_wspace(sk),
+		 sk->sk_sndbuf, copied, ret);
 	release_sock(sk);
-	return ret;
+	return copied ? : ret;
 }
 
 static void mptcp_wait_data(struct sock *sk, long *timeo)
