@@ -845,8 +845,15 @@ out:
 		sk_mem_reclaim_partial(sk);
 
 		/* Only wake up writers if a subflow is ready */
-		if (test_bit(MPTCP_SEND_SPACE, &msk->flags))
+		pr_debug("msk=%p writable=%d:%d:%d", sk,
+			sk_stream_is_writeable(sk), sk_stream_min_wspace(sk),
+			sk->sk_sndbuf);
+		if (sk_stream_is_writeable(sk)) {
+			set_bit(MPTCP_SEND_SPACE, &mptcp_sk(sk)->flags);
+			smp_mb__after_atomic();
+			/* set SEND_SPACE before sk_stream_write_space clears NOSPACE */
 			sk_stream_write_space(sk);
+		}
 	}
 }
 
@@ -1114,6 +1121,11 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk,
 
 		subflow = list_entry(pos, struct mptcp_subflow_context, node);
 		ssk =  mptcp_subflow_tcp_sock(subflow);
+
+		pr_debug("msk=%p ssk=%p last=%p active=%d backup=%d space=%d",
+			 msk, ssk, msk->last_snd,
+			 mptcp_subflow_active(subflow, fallback),
+			 subflow->backup, sk_stream_wspace(ssk));
 		if (!mptcp_subflow_active(subflow, fallback))
 			continue;
 
