@@ -1041,7 +1041,7 @@ static bool mptcp_subflow_active(struct mptcp_subflow_context *subflow)
 	return ((1 << ssk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT));
 }
 
-#define MPTCP_SEND_BURST_SIZE		BIT(15)
+#define MPTCP_SEND_BURST_SIZE		(1 << 15)
 
 static struct list_head *mptcp_next_subflow(struct mptcp_sock *msk,
 					    struct list_head *pos,
