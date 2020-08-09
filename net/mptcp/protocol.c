@@ -57,6 +57,22 @@ static struct socket *__mptcp_nmpc_socket(const struct mptcp_sock *msk)
 	return msk->subflow;
 }
 
+/* Returns end sequence number of the receiver's advertised window */
+static u64 mptcp_wnd_end(const struct mptcp_sock *msk)
+{
+	return atomic64_read(&msk->wnd_end);
+}
+
+static bool mptcp_has_zero_window(const struct mptcp_sock *msk)
+{
+	return msk->write_seq == mptcp_wnd_end(msk);
+}
+
+static bool mptcp_has_unacked_data(const struct mptcp_sock *msk)
+{
+	return mptcp_rtx_head((const struct sock *)msk) != NULL;
+}
+
 static bool mptcp_is_tcpsk(struct sock *sk)
 {
 	struct socket *sock = sk->sk_socket;
@@ -174,6 +190,7 @@ static void mptcp_data_queue_ofo(struct mptcp_sock *msk, struct sk_buff *skb)
 	if (after64(seq, max_seq)) {
 		/* out of window */
 		mptcp_drop(sk, skb);
+		pr_info("oow by %ld\n", (unsigned long)seq - (unsigned long)max_seq);
 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_NODSSWINDOW);
 		return;
 	}
@@ -835,8 +852,11 @@ static void mptcp_clean_una(struct sock *sk)
 	/* on fallback we just need to ignore snd_una, as this is really
 	 * plain TCP
 	 */
-	if (__mptcp_check_fallback(msk))
+	if (__mptcp_check_fallback(msk)) {
 		atomic64_set(&msk->snd_una, msk->snd_nxt);
+		atomic64_set(&msk->wnd_end, msk->snd_nxt + 1);
+	}
+
 	snd_una = atomic64_read(&msk->snd_una);
 
 	list_for_each_entry_safe(dfrag, dtmp, &msk->rtx_queue, list) {
@@ -939,6 +959,28 @@ struct mptcp_sendmsg_info {
 	unsigned int flags;
 };
 
+static int mptcp_check_allowed_size(struct mptcp_sock *msk, const struct mptcp_sendmsg_info *info)
+{
+	u64 window_end = mptcp_wnd_end(msk);
+
+	if (__mptcp_check_fallback(msk))
+		return info->size_goal;
+
+	if (!before64(msk->snd_nxt + info->size_goal, window_end)) {
+		u64 allowed_size = window_end - msk->snd_nxt;
+
+		/* Zero window and all data acked? Probe. */
+		if (allowed_size == 0 && !mptcp_has_unacked_data(msk)) {
+			pr_info_ratelimited("%s: avail_size %d, allowed %d use mss_now %d\n", __func__, info->size_goal, (int)allowed_size, info->mss_now);
+			allowed_size = info->mss_now;
+		}
+
+		return min_t(unsigned int, allowed_size, info->size_goal);
+	}
+
+	return info->size_goal;
+}
+
 static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 			      struct mptcp_data_frag *dfrag,
 			      struct mptcp_sendmsg_info *info)
@@ -956,7 +998,7 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 
 	/* compute send limit */
 	info->mss_now = tcp_send_mss(ssk, &info->size_goal, info->flags);
-	avail_size = info->size_goal;
+	avail_size = mptcp_check_allowed_size(msk, info);
 	skb = tcp_write_queue_tail(ssk);
 	if (skb) {
 		/* Limit the write to the size available in the
@@ -970,8 +1012,10 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 			 mptcp_skb_can_collapse_to(data_seq, skb, mpext);
 		if (!can_collapse)
 			TCP_SKB_CB(skb)->eor = 1;
+		else if (avail_size > skb->len)
+			avail_size -= skb->len;
 		else
-			avail_size = info->size_goal - skb->len;
+			avail_size = 0;
 	}
 
 	if (WARN_ON_ONCE(info->sent > info->limit ||
@@ -1082,6 +1126,10 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk,
 		*sndbuf = msk->first->sk_sndbuf;
 		return sk_stream_memory_free(msk->first) ? msk->first : NULL;
 	}
+
+	/* Probe if we have zero window while everything has been acked */
+	if (mptcp_has_zero_window(msk) && mptcp_has_unacked_data(msk))
+		return NULL;
 
 	/* re-use last subflow, if the burst allow that */
 	if (msk->last_snd && msk->snd_burst > 0 &&
@@ -2177,6 +2225,8 @@ struct sock *mptcp_sk_clone(const struct sock *sk,
 	msk->write_seq = subflow_req->idsn + 1;
 	msk->snd_nxt = msk->write_seq;
 	atomic64_set(&msk->snd_una, msk->write_seq);
+	atomic64_set(&msk->wnd_end, msk->snd_nxt + req->rsk_rcv_wnd);
+
 	if (mp_opt->mp_capable) {
 		msk->can_ack = true;
 		msk->remote_key = mp_opt->sndr_key;
@@ -2211,6 +2261,8 @@ void mptcp_rcv_space_init(struct mptcp_sock *msk, const struct sock *ssk)
 				      TCP_INIT_CWND * tp->advmss);
 	if (msk->rcvq_space.space == 0)
 		msk->rcvq_space.space = TCP_INIT_CWND * TCP_MSS_DEFAULT;
+
+	atomic64_set(&msk->wnd_end, msk->snd_nxt + tcp_sk(ssk)->snd_wnd);
 }
 
 static struct sock *mptcp_accept(struct sock *sk, int flags, int *err,

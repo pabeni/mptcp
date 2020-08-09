@@ -790,10 +790,12 @@ static u64 expand_ack(u64 old_ack, u64 cur_ack, bool use_64bit)
 	return cur_ack;
 }
 
-static void update_una(struct mptcp_sock *msk,
-		       struct mptcp_options_received *mp_opt)
+static void ack_update_msk(struct mptcp_sock *msk,
+			   const struct sock *ssk,
+			   struct mptcp_options_received *mp_opt)
 {
 	u64 new_snd_una, snd_una, old_snd_una = atomic64_read(&msk->snd_una);
+	u64 new_wnd_end, wnd_end, old_wnd_end = atomic64_read(&msk->wnd_end);
 	u64 snd_nxt = READ_ONCE(msk->snd_nxt);
 
 	/* avoid ack expansion on update conflict, to reduce the risk of
@@ -805,6 +807,16 @@ static void update_una(struct mptcp_sock *msk,
 	/* ACK for data not even sent yet? Ignore. */
 	if (after64(new_snd_una, snd_nxt))
 		new_snd_una = old_snd_una;
+
+	new_wnd_end = new_snd_una + tcp_sk(ssk)->snd_wnd;
+
+	while (after64(new_wnd_end, old_wnd_end)) {
+		wnd_end = old_wnd_end;
+		old_wnd_end = atomic64_cmpxchg(&msk->wnd_end, wnd_end,
+							       new_wnd_end);
+		if (old_wnd_end == wnd_end)
+			break;
+	}
 
 	while (after64(new_snd_una, old_snd_una)) {
 		snd_una = old_snd_una;
@@ -910,7 +922,7 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
 	 * monodirectional flows will stuck
 	 */
 	if (mp_opt.use_ack)
-		update_una(msk, &mp_opt);
+		ack_update_msk(msk, sk, &mp_opt);
 
 	/* Zero-data-length packets are dropped by the caller and not
 	 * propagated to the MPTCP layer, so the skb extension does not
