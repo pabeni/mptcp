@@ -502,6 +502,9 @@ do_transfer()
 		return 0
 	fi
 
+	ip netns exec ${listener_ns} nstat -z -a
+	ip netns exec ${connector_ns} nstat -z -a
+
 	cat "$capout"
 	return 1
 }
