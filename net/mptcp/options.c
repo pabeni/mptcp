@@ -454,6 +454,10 @@ static void mptcp_write_data_fin(struct mptcp_subflow_context *subflow,
 {
 	u64 data_fin_tx_seq = READ_ONCE(mptcp_sk(subflow->conn)->write_seq);
 
+	pr_debug("msk=%p ssk=%p FIN seq=%llx data seq=%llx len=%d emit df=%d",
+	         subflow->conn,
+		 skb->sk, data_fin_tx_seq, ext->data_seq, ext->data_len,
+	         ext->data_seq + ext->data_len == data_fin_tx_seq);
 	if (!ext->use_map || !skb->len) {
 		/* RFC6824 requires a DSS mapping with specific values
 		 * if DATA_FIN is set but no data payload is mapped
@@ -467,6 +471,8 @@ static void mptcp_write_data_fin(struct mptcp_subflow_context *subflow,
 		ext->data_seq = data_fin_tx_seq - 1;
 		ext->subflow_seq = 0;
 		ext->data_len = 1;
+		pr_debug("msk=%p ssk=%p FIN seq=%llx 0len", subflow->conn,
+			 skb->sk, data_fin_tx_seq);
 	} else if (ext->data_seq + ext->data_len == data_fin_tx_seq) {
 		/* If there's an existing DSS mapping and it is the
 		 * final mapping, DATA_FIN consumes 1 additional byte of
@@ -831,6 +837,8 @@ static void ack_update_msk(struct mptcp_sock *msk,
 
 bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq)
 {
+	pr_debug("msk=%p rcv data fin=%llx already=%d first=%p",
+	         msk, data_fin_seq, msk->rcv_data_fin, msk->first);
 	/* Skip if DATA_FIN was already received.
 	 * If updating simultaneously with the recvmsg loop, values
 	 * should match. If they mismatch, the peer is misbehaving and
