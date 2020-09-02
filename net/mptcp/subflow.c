@@ -642,10 +642,15 @@ static u64 expand_seq(u64 old_seq, u16 old_data_len, u64 seq)
 	return seq | ((old_seq + old_data_len + 1) & GENMASK_ULL(63, 32));
 }
 
-static void warn_bad_map(struct mptcp_subflow_context *subflow, u32 ssn)
+static void warn_bad_map(struct mptcp_subflow_context *subflow,
+			 struct sk_buff *skb, u32 ssn)
 {
-	WARN_ONCE(1, "Bad mapping: ssn=%d map_seq=%d map_data_len=%d",
-		  ssn, subflow->map_subflow_seq, subflow->map_data_len);
+	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
+
+	WARN_ONCE(1, "Bad mapping: ack_seq=%llx map_seq=%llx ssn=%d map_subflow_seq=%d map_data_len=%d len=%d",
+		  msk->ack_seq, subflow->map_seq, ssn,
+		  subflow->map_subflow_seq, subflow->map_data_len,
+		  skb->len);
 }
 
 static bool skb_is_fully_mapped(struct sock *ssk, struct sk_buff *skb)
@@ -670,13 +675,13 @@ static bool validate_mapping(struct sock *ssk, struct sk_buff *skb)
 		/* Mapping covers data later in the subflow stream,
 		 * currently unsupported.
 		 */
-		warn_bad_map(subflow, ssn);
+		warn_bad_map(subflow, skb, ssn);
 		return false;
 	}
 	if (unlikely(!before(ssn, subflow->map_subflow_seq +
 				  subflow->map_data_len))) {
 		/* Mapping does covers past subflow data, invalid */
-		warn_bad_map(subflow, ssn + skb->len);
+		warn_bad_map(subflow, skb, ssn + skb->len);
 		return false;
 	}
 	return true;
@@ -714,8 +719,10 @@ static enum mapping_status get_mapping_status(struct sock *ssk,
 			return MAPPING_EMPTY;
 		}
 
-		if (!subflow->map_valid)
+		if (!subflow->map_valid) {
+			pr_warn("no map, ext present %d skb len %d", !!mpext, skb->len);
 			return MAPPING_INVALID;
+		}
 
 		goto validate_seq;
 	}
@@ -781,6 +788,10 @@ static enum mapping_status get_mapping_status(struct sock *ssk,
 		 * the new map would need caching, which is not supported
 		 */
 		if (skb_is_fully_mapped(ssk, skb)) {
+			int skb_consumed = tcp_sk(ssk)->copied_seq - TCP_SKB_CB(skb)->seq;
+
+			pr_warn("not fully mapped, skb len=%d consumed=%d map len=%d offset=%lld",
+			        skb->len, skb_consumed, subflow->map_data_len, mptcp_subflow_get_map_offset(subflow));
 			MPTCP_INC_STATS(sock_net(ssk), MPTCP_MIB_DSSNOMATCH);
 			return MAPPING_INVALID;
 		}
@@ -814,6 +825,7 @@ static void mptcp_subflow_discard_data(struct sock *ssk, struct sk_buff *skb,
 {
 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
 	bool fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
+	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
 	u32 incr;
 
 	incr = limit >= skb->len ? skb->len + fin : limit;
@@ -822,10 +834,18 @@ static void mptcp_subflow_discard_data(struct sock *ssk, struct sk_buff *skb,
 		 subflow->map_subflow_seq);
 	MPTCP_INC_STATS(sock_net(ssk), MPTCP_MIB_DUPDATA);
 	tcp_sk(ssk)->copied_seq += incr;
-	if (!before(tcp_sk(ssk)->copied_seq, TCP_SKB_CB(skb)->end_seq))
+	if (!before(tcp_sk(ssk)->copied_seq, TCP_SKB_CB(skb)->end_seq)) {
+		pr_debug("eating consumed old skb seq=%x:%x map %llx:%llx",
+		         tcp_sk(ssk)->copied_seq, TCP_SKB_CB(skb)->end_seq,
+		         subflow->map_seq, msk->ack_seq);
 		sk_eat_skb(ssk, skb);
-	if (mptcp_subflow_get_map_offset(subflow) >= subflow->map_data_len)
+	}
+	if (mptcp_subflow_get_map_offset(subflow) >= subflow->map_data_len) {
+		pr_debug("clearing old map offset=%lld len=%d seq=%lld:%lld",
+		         mptcp_subflow_get_map_offset(subflow), subflow->map_data_len,
+		         subflow->map_seq, msk->ack_seq);
 		subflow->map_valid = 0;
+	}
 	if (incr)
 		tcp_cleanup_rbuf(ssk, incr);
 }
@@ -979,6 +999,10 @@ static void subflow_write_space(struct sock *sk)
 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
 	struct sock *parent = subflow->conn;
 
+	pr_debug("msk=%p:%d:%d:%d ssk=%p:%d:%d:%d", parent, sk_stream_wspace(parent),
+	         parent->sk_sndbuf, sk_stream_is_writeable(parent),
+	         sk, sk_stream_wspace(sk), sk->sk_sndbuf,
+	         sk_stream_is_writeable(sk));
 	if (!sk_stream_is_writeable(sk))
 		return;
 
