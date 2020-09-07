@@ -935,7 +935,7 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 		/* reuse tail pfrag, if possible, or carve a new one from the
 		 * page allocator
 		 */
-		dfrag = mptcp_rtx_tail(sk);
+		dfrag = mptcp_pending_tail(sk);
 		offset = pfrag->offset;
 		dfrag_collapsed = mptcp_frag_can_collapse_to(msk, pfrag, dfrag);
 		if (!dfrag_collapsed) {
@@ -1802,6 +1802,7 @@ static int __mptcp_init_sock(struct sock *sk)
 	__set_bit(MPTCP_SEND_SPACE, &msk->flags);
 	INIT_WORK(&msk->work, mptcp_worker);
 	msk->out_of_order_queue = RB_ROOT;
+	msk->first_pending = NULL;
 
 	msk->first = NULL;
 	inet_csk(sk)->icsk_sync_mss = mptcp_sync_mss;
