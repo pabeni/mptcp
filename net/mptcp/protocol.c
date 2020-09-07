@@ -853,6 +853,7 @@ out:
 static bool mptcp_page_frag_refill(struct sock *sk, struct page_frag *pfrag)
 {
 	struct mptcp_subflow_context *subflow;
+	struct mptcp_sock *msk = mptcp_sk(sk);
 	bool first = true;
 
 	if (likely(skb_page_frag_refill(32U + sizeof(struct mptcp_data_frag),
@@ -889,28 +890,29 @@ mptcp_carve_data_frag(const struct mptcp_sock *msk, struct page_frag *pfrag,
 	return dfrag;
 }
 
+struct mptcp_sendmsg_info {
+	int mss_now;
+	int size_goal;
+	int flags;
+};
+
 static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
-			      struct msghdr *msg, struct mptcp_data_frag *dfrag,
-			      u16 already_sent, long *timeo, int *pmss_now,
-			      int *ps_goal)
+			      struct mptcp_data_frag *dfrag,
+			      u16 sent, struct mptcp_sendmsg_info *info)
 {
-	int mss_now, avail_size, size_goal, ret;
 	struct mptcp_sock *msk = mptcp_sk(sk);
 	struct mptcp_ext *mpext = NULL;
 	struct sk_buff *skb, *tail;
 	bool can_collapse = false;
-	struct page *page;
+	int avail_size, ret;
 	size_t psize;
 
 	pr_debug("msk=%p ssk=%p sending dfrag at seq=%lld len=%d already sent=%d",
-	         msk, ssk, dfrag->data_seq, dfrag->data_len, already_sent);
-	page = dfrag->page;
+	         msk, ssk, dfrag->data_seq, dfrag->data_len, sent);
 
 	/* compute send limit */
-	mss_now = tcp_send_mss(ssk, &size_goal, msg->msg_flags);
-	*pmss_now = mss_now;
-	*ps_goal = size_goal;
-	avail_size = size_goal;
+	info->mss_now = tcp_send_mss(ssk, &info->size_goal, info->flags);
+	avail_size = info->size_goal;
 	skb = tcp_write_queue_tail(ssk);
 	if (skb) {
 		mpext = skb_ext_find(skb, SKB_EXT_MPTCP);
@@ -921,24 +923,24 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 		 * queue management operation, to avoid breaking the ext <->
 		 * SSN association set here
 		 */
-		can_collapse = (size_goal - skb->len > 0) &&
+		can_collapse = (info->size_goal - skb->len > 0) &&
 			 mptcp_skb_can_collapse_to(dfrag->data_seq, skb, mpext);
 		if (!can_collapse)
 			TCP_SKB_CB(skb)->eor = 1;
 		else
-			avail_size = size_goal - skb->len;
+			avail_size = info->size_goal - skb->len;
 	}
 
-	if (WARN_ON_ONCE(already_sent > dfrag->data_len))
+	if (WARN_ON_ONCE(sent > dfrag->data_len))
 		return 0;
 
-	psize = min_t(size_t, dfrag->data_len - already_sent, avail_size);
+	psize = min_t(size_t, dfrag->data_len - sent, avail_size);
 
 	/* tell the TCP stack to delay the push so that we can safely
 	 * access the skb after the sendpages call
 	 */
-	ret = do_tcp_sendpages(ssk, page, dfrag->offset + already_sent, psize,
-			       msg->msg_flags | MSG_SENDPAGE_NOTLAST | MSG_DONTWAIT);
+	ret = do_tcp_sendpages(ssk, dfrag->page, dfrag->offset + sent, psize,
+			       info->flags | MSG_SENDPAGE_NOTLAST | MSG_DONTWAIT);
 	if (ret <= 0)
 		return ret;
 
@@ -1093,11 +1095,13 @@ static void ssk_check_wmem(struct mptcp_sock *msk)
 		mptcp_nospace(msk);
 }
 
-static void mptcp_push_pending(struct sock *sk, struct msghdr *msg, long timeo)
+static void mptcp_push_pending(struct sock *sk, unsigned flags)
 {
 	struct sock *prev_ssk = NULL, *ssk = NULL;
 	struct mptcp_sock *msk = mptcp_sk(sk);
-	int mss_now = 0, size_goal = 0;
+	struct mptcp_sendmsg_info info = {
+				.flags = flags,
+	};
 	struct mptcp_data_frag *dfrag;
 	int copied = 0;
 	bool slowpath;
@@ -1120,8 +1124,8 @@ static void mptcp_push_pending(struct sock *sk, struct msghdr *msg, long timeo)
 			 * consecutive xmit on the same socket
 			 */
 			if (ssk != prev_ssk && prev_ssk) {
-				tcp_push(ssk, 0, mss_now, tcp_sk(ssk)->nonagle,
-					 size_goal);
+				tcp_push(ssk, 0, info.mss_now,
+					 tcp_sk(ssk)->nonagle, info.size_goal);
 				mptcp_set_timeout(sk, ssk);
 				unlock_sock_fast(prev_ssk, slowpath);
 			}
@@ -1130,9 +1134,8 @@ static void mptcp_push_pending(struct sock *sk, struct msghdr *msg, long timeo)
 			if (ssk != prev_ssk || !prev_ssk)
 				slowpath = lock_sock_fast(ssk);
 
-			ret = mptcp_sendmsg_frag(sk, ssk, msg, dfrag,
-						 dfrag->already_sent,
-						 &timeo, &mss_now, &size_goal);
+			ret = mptcp_sendmsg_frag(sk, ssk, dfrag,
+						 dfrag->already_sent, &info);
 			if (ret < 0) {
 				unlock_sock_fast(ssk, slowpath);
 				goto out;
@@ -1251,7 +1254,7 @@ wait_for_memory:
 	}
 
 	if (copied)
-		mptcp_push_pending(sk, msg, timeo);
+		mptcp_push_pending(sk, msg->msg_flags);
 
 out:
 	ssk_check_wmem(msk);
@@ -1666,14 +1669,15 @@ static void pm_work(struct mptcp_sock *msk)
 static void mptcp_worker(struct work_struct *work)
 {
 	struct mptcp_sock *msk = container_of(work, struct mptcp_sock, work);
-	int already_sent = 0, mss_now = 0, size_goal = 0;
 	struct sock *ssk, *sk = &msk->sk.icsk_inet.sk;
-	struct mptcp_data_frag *dfrag;
-	size_t copied = 0;
-	struct msghdr msg = {
-		.msg_flags = MSG_DONTWAIT,
+	struct mptcp_sendmsg_info info = {
+		.mss_now = 0,
+		.size_goal = 0,
+		.flags = 0,
 	};
-	long timeo = 0;
+	struct mptcp_data_frag *dfrag;
+	int already_sent = 0, ret;
+	size_t copied = 0;
 
 	lock_sock(sk);
 	mptcp_clean_una(sk);
@@ -1705,8 +1709,7 @@ static void mptcp_worker(struct work_struct *work)
 
 	lock_sock(ssk);
 	while (dfrag->data_len > 0) {
-		int ret = mptcp_sendmsg_frag(sk, ssk, &msg, dfrag, already_sent,
-					     &timeo, &mss_now, &size_goal);
+		ret = mptcp_sendmsg_frag(sk, ssk, dfrag, already_sent, &info);
 		if (ret < 0)
 			break;
 
@@ -1718,8 +1721,8 @@ static void mptcp_worker(struct work_struct *work)
 			break;
 	}
 	if (copied)
-		tcp_push(ssk, msg.msg_flags, mss_now, tcp_sk(ssk)->nonagle,
-			 size_goal);
+		tcp_push(ssk, 0, info.mss_now, tcp_sk(ssk)->nonagle,
+			 info.size_goal);
 
 	mptcp_set_timeout(sk, ssk);
 	release_sock(ssk);
