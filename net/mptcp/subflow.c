@@ -806,6 +806,8 @@ validate_seq:
 	return MAPPING_OK;
 }
 
+void tcp_cleanup_rbuf(struct sock *sk, int copied);
+
 static void mptcp_subflow_discard_data(struct sock *ssk, struct sk_buff *skb,
 				       unsigned limit)
 {
@@ -823,6 +825,8 @@ static void mptcp_subflow_discard_data(struct sock *ssk, struct sk_buff *skb,
 		sk_eat_skb(ssk, skb);
 	if (mptcp_subflow_get_map_offset(subflow) >= subflow->map_data_len)
 		subflow->map_valid = 0;
+	if (incr)
+		tcp_cleanup_rbuf(ssk, incr);
 }
 
 static bool subflow_check_data_avail(struct sock *ssk)
