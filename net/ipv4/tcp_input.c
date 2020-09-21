@@ -3673,6 +3673,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	u32 lost = tp->lost;
 	int rexmit = REXMIT_NONE; /* Flag to (re)transmit to recover losses */
 	u32 prior_fack;
+	int old_s;
 
 	sack_state.first_sackt = 0;
 	sack_state.rate = &rs;
@@ -3799,8 +3800,10 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 			if (!(flag & FLAG_DATA))
 				num_dupack = max_t(u16, 1, skb_shinfo(skb)->gso_segs);
 		}
+		old_s = icsk->icsk_ca_state;
 		tcp_fastretrans_alert(sk, prior_snd_una, num_dupack, &flag,
 				      &rexmit);
+		pr_debug("ssk=%p 1 ca state=%x:%x", sk, old_s, icsk->icsk_ca_state);
 	}
 
 	if ((flag & FLAG_FORWARD_PROGRESS) || !(flag & FLAG_NOT_DUP))
@@ -3817,8 +3820,10 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 no_queue:
 	/* If data was DSACKed, see if we can undo a cwnd reduction. */
 	if (flag & FLAG_DSACKING_ACK) {
+		old_s = icsk->icsk_ca_state;
 		tcp_fastretrans_alert(sk, prior_snd_una, num_dupack, &flag,
 				      &rexmit);
+		pr_debug("ssk=%p 2 ca state=%x:%x", sk, old_s, icsk->icsk_ca_state);
 		tcp_newly_delivered(sk, delivered, flag);
 	}
 	/* If this ack opens up a zero window, clear backoff.  It was
@@ -3838,8 +3843,10 @@ old_ack:
 	if (TCP_SKB_CB(skb)->sacked) {
 		flag |= tcp_sacktag_write_queue(sk, skb, prior_snd_una,
 						&sack_state);
+		old_s = icsk->icsk_ca_state;
 		tcp_fastretrans_alert(sk, prior_snd_una, num_dupack, &flag,
 				      &rexmit);
+		pr_debug("ssk=%p 3 ca state=%x:%x", sk, old_s, icsk->icsk_ca_state);
 		tcp_newly_delivered(sk, delivered, flag);
 		tcp_xmit_recovery(sk, rexmit);
 	}
