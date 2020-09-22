@@ -1922,6 +1922,12 @@ static void mptcp_close(struct sock *sk, long timeout)
 		goto cleanup;
 	}
 
+	while (mptcp_send_head(sk)) {
+		release_sock(sk);
+		msleep(250);
+		lock_sock(sk);
+	}
+
 	if (__mptcp_check_fallback(msk)) {
 		goto update_state;
 	} else if (mptcp_close_state(sk)) {
@@ -2638,6 +2644,7 @@ static int mptcp_shutdown(struct socket *sock, int how)
 {
 	struct mptcp_sock *msk = mptcp_sk(sock->sk);
 	struct mptcp_subflow_context *subflow;
+	struct sock *sk = sock->sk;
 	int ret = 0;
 
 	pr_debug("sk=%p, how=%d", msk, how);
@@ -2656,6 +2663,12 @@ static int mptcp_shutdown(struct socket *sock, int how)
 			sock->state = SS_DISCONNECTING;
 		else
 			sock->state = SS_CONNECTED;
+	}
+
+	while (mptcp_send_head(sk)) {
+		release_sock(sk);
+		msleep(250);
+		lock_sock(sk);
 	}
 
 	/* If we've already sent a FIN, or it's a closed state, skip this. */
