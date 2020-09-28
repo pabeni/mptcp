@@ -1251,8 +1251,12 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		dfrag = mptcp_pending_tail(sk);
 		dfrag_collapsed = mptcp_frag_can_collapse_to(msk, pfrag, dfrag);
 		if (!dfrag_collapsed) {
-			if (!sk_stream_memory_free(sk) ||
-			    !mptcp_page_frag_refill(sk, pfrag))
+			if (!sk_stream_memory_free(sk)) {
+				mptcp_push_pending(sk, msg->msg_flags);
+				if (!sk_stream_memory_free(sk))
+					goto wait_for_memory;
+			}
+			if (!mptcp_page_frag_refill(sk, pfrag))
 				goto wait_for_memory;
 
 			dfrag = mptcp_carve_data_frag(msk, pfrag, pfrag->offset);
@@ -1303,6 +1307,8 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 
 wait_for_memory:
 		mptcp_nospace(msk);
+		if (mptcp_timer_pending(sk))
+			mptcp_reset_timer(sk);
 		ret = sk_stream_wait_memory(sk, &timeo);
 		if (ret)
 			goto out;
@@ -1608,7 +1614,8 @@ static void mptcp_retransmit_handler(struct sock *sk)
 	if (atomic64_read(&msk->snd_una) == READ_ONCE(msk->snd_nxt)) {
 		mptcp_stop_timer(sk);
 	} else {
-		set_bit(MPTCP_WORK_RTX, &msk->flags);
+		if (!__mptcp_check_fallback(msk))
+			set_bit(MPTCP_WORK_RTX, &msk->flags);
 		mptcp_schedule_work(sk);
 	}
 }
@@ -1802,6 +1809,9 @@ static void mptcp_worker(struct work_struct *work)
 	}
 
 	if (!test_and_clear_bit(MPTCP_WORK_RTX, &msk->flags))
+		goto unlock;
+
+	if (WARN_ON(__mptcp_check_fallback(msk)))
 		goto unlock;
 
 	dfrag = mptcp_rtx_head(sk);
