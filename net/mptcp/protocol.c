@@ -927,20 +927,20 @@ struct mptcp_sendmsg_info {
 };
 
 static int mptcp_check_allowed_size(struct mptcp_sock *msk, u64 data_seq,
-				    const struct mptcp_sendmsg_info *info)
+				    int avail_size)
 {
 	u64 window_end = mptcp_wnd_end(msk);
 
 	if (__mptcp_check_fallback(msk))
-		return info->size_goal;
+		return avail_size;
 
-	if (!before64(data_seq + info->size_goal, window_end)) {
+	if (!before64(data_seq + avail_size, window_end)) {
 		u64 allowed_size = window_end - data_seq;
 
-		return min_t(unsigned int, allowed_size, info->size_goal);
+		return min_t(unsigned int, allowed_size, avail_size);
 	}
 
-	return info->size_goal;
+	return avail_size;
 }
 
 static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
@@ -961,7 +961,7 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 
 	/* compute send limit */
 	info->mss_now = tcp_send_mss(ssk, &info->size_goal, info->flags);
-	avail_size = mptcp_check_allowed_size(msk, data_seq, info);
+	avail_size = info->size_goal;
 	skb = tcp_write_queue_tail(ssk);
 	if (skb) {
 		/* Limit the write to the size available in the
@@ -975,17 +975,16 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 			 mptcp_skb_can_collapse_to(data_seq, skb, mpext);
 		if (!can_collapse)
 			TCP_SKB_CB(skb)->eor = 1;
-		else if (avail_size > skb->len)
-			avail_size -= skb->len;
 		else
-			avail_size = 0;
-	} else {
-		/* Zero window and all data acked? Probe. */
-		if (avail_size == 0 && !mptcp_has_unacked_data(msk)) {
-			zero_window_probe = true;
-			data_seq = atomic64_read(&msk->snd_una) - 1;
-			avail_size = 1;
-		}
+			avail_size = info->size_goal - skb->len;
+	}
+
+	/* Zero window and all data acked? Probe. */
+	avail_size = mptcp_check_allowed_size(msk, data_seq, avail_size);
+	if (avail_size == 0 && !mptcp_has_unacked_data(msk)) {
+		zero_window_probe = true;
+		data_seq = atomic64_read(&msk->snd_una) - 1;
+		avail_size = 1;
 	}
 
 	if (WARN_ON_ONCE(info->sent > info->limit ||
