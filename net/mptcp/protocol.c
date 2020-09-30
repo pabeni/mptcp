@@ -1614,8 +1614,7 @@ static void mptcp_retransmit_handler(struct sock *sk)
 	if (atomic64_read(&msk->snd_una) == READ_ONCE(msk->snd_nxt)) {
 		mptcp_stop_timer(sk);
 	} else {
-		if (!__mptcp_check_fallback(msk))
-			set_bit(MPTCP_WORK_RTX, &msk->flags);
+		set_bit(MPTCP_WORK_RTX, &msk->flags);
 		mptcp_schedule_work(sk);
 	}
 }
@@ -1809,9 +1808,6 @@ static void mptcp_worker(struct work_struct *work)
 	}
 
 	if (!test_and_clear_bit(MPTCP_WORK_RTX, &msk->flags))
-		goto unlock;
-
-	if (WARN_ON(__mptcp_check_fallback(msk)))
 		goto unlock;
 
 	dfrag = mptcp_rtx_head(sk);
