@@ -170,10 +170,7 @@ enum mptcp_pm_status {
 enum mptcp_add_addr_status {
 	MPTCP_ADD_ADDR_SIGNAL,
 	MPTCP_ADD_ADDR_ECHO,
-<<<<<<< HEAD
 	MPTCP_ADD_ADDR_IPV6,
-=======
->>>>>>> 10857c8654f0... mptcp: change add_addr_signal type
 };
 
 struct mptcp_pm_data {
