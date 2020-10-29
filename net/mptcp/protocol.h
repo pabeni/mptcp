@@ -228,6 +228,7 @@ struct mptcp_sock {
 	unsigned long	timer_ival;
 	u32		token;
 	int		rmem_pending;
+	spinlock_t	data_lock;
 	unsigned long	flags;
 	bool		can_ack;
 	bool		fully_established;

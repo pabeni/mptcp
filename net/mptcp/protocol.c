@@ -578,7 +578,7 @@ static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
 	return done;
 }
 
-static bool mptcp_ofo_queue(struct mptcp_sock *msk)
+static bool __mptcp_ofo_queue(struct mptcp_sock *msk)
 {
 	struct sock *sk = (struct sock *)msk;
 	struct sk_buff *skb, *tail;
@@ -621,37 +621,40 @@ static bool mptcp_ofo_queue(struct mptcp_sock *msk)
 	return moved;
 }
 
+static bool mptcp_ofo_queue(struct mptcp_sock *msk)
+{
+	bool ret;
+
+	if (!rb_first(&msk->out_of_order_queue))
+		return false;
+
+	spin_lock_bh(&msk->data_lock);
+	ret = __mptcp_ofo_queue(msk);
+	spin_unlock_bh(&msk->data_lock);
+	return ret;
+}
+
 /* In most cases we will be able to lock the mptcp socket.  If its already
  * owned, we need to defer to the work queue to avoid ABBA deadlock.
  */
-static bool move_skbs_to_msk(struct mptcp_sock *msk, struct sock *ssk)
+static void move_skbs_to_msk(struct mptcp_sock *msk, struct sock *ssk)
 {
 	struct sock *sk = (struct sock *)msk;
 	unsigned int moved = 0;
 
-	if (READ_ONCE(sk->sk_lock.owned))
-		return false;
+	spin_lock_bh(&msk->data_lock);
 
-	if (unlikely(!spin_trylock_bh(&sk->sk_lock.slock)))
-		return false;
+	__mptcp_move_skbs_from_subflow(msk, ssk, &moved);
+	__mptcp_ofo_queue(msk);
 
-	/* must re-check after taking the lock */
-	if (!READ_ONCE(sk->sk_lock.owned)) {
-		__mptcp_move_skbs_from_subflow(msk, ssk, &moved);
-		mptcp_ofo_queue(msk);
-
-		/* If the moves have caught up with the DATA_FIN sequence number
-		 * it's time to ack the DATA_FIN and change socket state, but
-		 * this is not a good place to change state. Let the workqueue
-		 * do it.
-		 */
-		if (mptcp_pending_data_fin(sk, NULL))
-			mptcp_schedule_work(sk);
-	}
-
-	spin_unlock_bh(&sk->sk_lock.slock);
-
-	return moved > 0;
+	/* If the moves have caught up with the DATA_FIN sequence number
+	 * it's time to ack the DATA_FIN and change socket state, but
+	 * this is not a good place to change state. Let the workqueue
+	 * do it.
+	 */
+	if (mptcp_pending_data_fin(sk, NULL))
+		mptcp_schedule_work(sk);
+	spin_unlock_bh(&msk->data_lock);
 }
 
 void mptcp_data_ready(struct sock *sk, struct sock *ssk)
@@ -823,6 +826,7 @@ static void mptcp_mem_reclaim_partial(struct sock *sk)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
 
+	spin_lock_bh(&msk->data_lock);
 	sk->sk_forward_alloc += msk->wforward_alloc;
 	msk->wforward_alloc = 0;
 	sk_mem_reclaim_partial(sk);
@@ -830,6 +834,7 @@ static void mptcp_mem_reclaim_partial(struct sock *sk)
 	/* split the remaining fwd allocated memory between rx and tx */
 	msk->wforward_alloc = sk->sk_forward_alloc >> 1;
 	sk->sk_forward_alloc -= msk->wforward_alloc;
+	spin_unlock_bh(&msk->data_lock);
 }
 
 static void dfrag_uncharge(struct sock *sk, int len)
@@ -1275,14 +1280,18 @@ static bool mptcp_wmem_alloc(struct sock *sk, int size)
 	if (msk->wforward_alloc >= size)
 		goto account;
 
+	spin_lock_bh(&msk->data_lock);
 	ret = sk_wmem_schedule(sk, size);
-	if (!ret)
+	if (!ret) {
+		spin_lock_bh(&msk->data_lock);
 		return false;
+	}
 
 	/* try to keep half fwd alloc memory for each direction */
 	amount = max(size, sk->sk_forward_alloc >> 1);
 	sk->sk_forward_alloc -= amount;
 	msk->wforward_alloc += amount;
+	spin_unlock_bh(&msk->data_lock);
 
 account:
 	msk->wforward_alloc -= size;
@@ -1566,11 +1575,17 @@ static bool __mptcp_move_skbs(struct mptcp_sock *msk, unsigned int rcv)
 		struct sock *ssk = mptcp_subflow_recv_lookup(msk);
 		bool slowpath;
 
-		if (!ssk)
+		/* we can have data pending in the subflows only if the msk
+		 * receive buffer was full at subflow_data_ready() time,
+		 * it is an likely slow path
+		 */
+		if (likely(!ssk))
 			break;
 
 		slowpath = lock_sock_fast(ssk);
+		spin_lock_bh(&msk->data_lock);
 		done = __mptcp_move_skbs_from_subflow(msk, ssk, &moved);
+		spin_unlock_bh(&msk->data_lock);
 		if (moved && rcv) {
 			WRITE_ONCE(msk->rmem_pending, min(rcv, moved));
 			tcp_cleanup_rbuf(ssk, 1);
@@ -1985,6 +2000,7 @@ static int __mptcp_init_sock(struct sock *sk)
 	struct mptcp_sock *msk = mptcp_sk(sk);
 
 	spin_lock_init(&msk->join_list_lock);
+	spin_lock_init(&msk->data_lock);
 
 	INIT_LIST_HEAD(&msk->conn_list);
 	INIT_LIST_HEAD(&msk->join_list);
@@ -2182,9 +2198,12 @@ static void __mptcp_destroy_sock(struct sock *sk)
 
 	sk->sk_prot->destroy(sk);
 
+	spin_lock_bh(&msk->data_lock);
 	sk->sk_forward_alloc += msk->wforward_alloc;
 	msk->wforward_alloc = 0;
 	sk_stream_kill_queues(sk);
+	spin_unlock_bh(&msk->data_lock);
+
 	xfrm_sk_free_policy(sk);
 	sk_refcnt_debug_release(sk);
 	sock_put(sk);
