@@ -228,6 +228,7 @@ struct mptcp_sock {
 	unsigned long	timer_ival;
 	u32		token;
 	int		rmem_pending;
+	spinlock_t	data_lock;
 	unsigned long	flags;
 	bool		can_ack;
 	bool		fully_established;
@@ -238,6 +239,7 @@ struct mptcp_sock {
 	struct work_struct work;
 	struct sk_buff  *ooo_last_skb;
 	struct rb_root  out_of_order_queue;
+	struct sk_buff_head receive_queue;
 	struct list_head conn_list;
 	struct list_head rtx_queue;
 	struct mptcp_data_frag *first_pending;
