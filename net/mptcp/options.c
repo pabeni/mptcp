@@ -855,7 +855,7 @@ static void ack_update_msk(struct mptcp_sock *msk,
 		old_wnd_end = atomic64_cmpxchg(&msk->wnd_end, wnd_end,
 					       new_wnd_end);
 		if (old_wnd_end == wnd_end) {
-			if (mptcp_send_head(sk))
+			if (mptcp_send_pending(sk))
 				mptcp_schedule_work(sk);
 			break;
 		}

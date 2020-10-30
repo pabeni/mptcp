@@ -219,6 +219,17 @@ struct mptcp_sock {
 	u64		ack_seq;
 	u64		rcv_wnd_sent;
 	u64		rcv_data_fin_seq;
+
+	/* if the next to send dfrag has been already partially
+	 * transmitted - bytes_sent > 0 - and also partially acked;
+	 * 'next_send_acked_bytes' is the number of such acked bytes;
+	 * and 'next_send_acked_seq' the corresponding sequence number,
+	 * cached here from the corresponding dfrag contents, to avoid
+	 * accessing the rtx queue
+	 */
+	u64		next_send_acked_seq;
+	u16		next_send_acked_bytes;
+	u16		next_send_bytes;
 	int		wforward_alloc;
 	struct sock	*last_snd;
 	int		snd_burst;
@@ -242,7 +253,7 @@ struct mptcp_sock {
 	struct sk_buff_head receive_queue;
 	struct list_head conn_list;
 	struct list_head rtx_queue;
-	struct mptcp_data_frag *first_pending;
+	struct list_head pending_queue;
 	struct list_head join_list;
 	struct skb_ext	*cached_ext;	/* for the next sendmsg */
 	struct socket	*subflow; /* outgoing connect/listener/!mp_capable */
@@ -269,51 +280,42 @@ static inline int __mptcp_space(const struct sock *sk)
 	return tcp_space(sk) + READ_ONCE(mptcp_sk(sk)->rmem_pending);
 }
 
+static inline bool mptcp_send_pending(const struct sock *sk)
+{
+	return !list_empty(&mptcp_sk(sk)->pending_queue);
+}
+
 static inline struct mptcp_data_frag *mptcp_send_head(const struct sock *sk)
 {
-	const struct mptcp_sock *msk = mptcp_sk(sk);
-
-	return READ_ONCE(msk->first_pending);
+	return list_first_entry_or_null(&mptcp_sk(sk)->pending_queue,
+					struct mptcp_data_frag, list);
 }
 
-static inline struct mptcp_data_frag *mptcp_send_next(struct sock *sk)
-{
-	struct mptcp_sock *msk = mptcp_sk(sk);
-	struct mptcp_data_frag *cur;
-
-	cur = msk->first_pending;
-	return list_is_last(&cur->list, &msk->rtx_queue) ? NULL :
-						     list_next_entry(cur, list);
-}
-
-static inline struct mptcp_data_frag *mptcp_pending_tail(const struct sock *sk)
+static inline struct mptcp_data_frag *mptcp_send_tail(const struct sock *sk)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
 
-	if (!msk->first_pending)
+	if (list_empty(&msk->pending_queue))
 		return NULL;
 
-	if (WARN_ON_ONCE(list_empty(&msk->rtx_queue)))
-		return NULL;
-
-	return list_last_entry(&msk->rtx_queue, struct mptcp_data_frag, list);
-}
-
-static inline struct mptcp_data_frag *mptcp_rtx_tail(const struct sock *sk)
-{
-	struct mptcp_sock *msk = mptcp_sk(sk);
-
-	if (!before64(msk->snd_nxt, atomic64_read(&msk->snd_una)))
-		return NULL;
-
-	return list_last_entry(&msk->rtx_queue, struct mptcp_data_frag, list);
+	return list_last_entry(&msk->pending_queue, struct mptcp_data_frag,
+			       list);
 }
 
 static inline struct mptcp_data_frag *mptcp_rtx_head(const struct sock *sk)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
+	struct mptcp_data_frag *ret;
 
-	return list_first_entry_or_null(&msk->rtx_queue, struct mptcp_data_frag, list);
+	if (!list_empty(&msk->rtx_queue))
+		return list_first_entry(&msk->rtx_queue, struct mptcp_data_frag,
+					list);
+
+	/* the first pending data frag may contain already sent data */
+	ret = mptcp_send_head(sk);
+	if (ret->already_sent)
+		return ret;
+	return NULL;
 }
 
 struct mptcp_subflow_request_sock {
