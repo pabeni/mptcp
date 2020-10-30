@@ -814,9 +814,27 @@ static bool mptcp_frag_can_collapse_to(const struct mptcp_sock *msk,
 		df->data_seq + df->data_len == msk->write_seq;
 }
 
+static void mptcp_wmem_uncharge(struct sock *sk, int size)
+{
+	mptcp_sk(sk)->wforward_alloc += size;
+}
+
+static void mptcp_mem_reclaim_partial(struct sock *sk)
+{
+	struct mptcp_sock *msk = mptcp_sk(sk);
+
+	sk->sk_forward_alloc += msk->wforward_alloc;
+	msk->wforward_alloc = 0;
+	sk_mem_reclaim_partial(sk);
+
+	/* split the remaining fwd allocated memory between rx and tx */
+	msk->wforward_alloc = sk->sk_forward_alloc >> 1;
+	sk->sk_forward_alloc -= msk->wforward_alloc;
+}
+
 static void dfrag_uncharge(struct sock *sk, int len)
 {
-	sk_mem_uncharge(sk, len);
+	mptcp_wmem_uncharge(sk, len);
 	sk_wmem_queued_add(sk, -len);
 }
 
@@ -871,8 +889,8 @@ static void mptcp_clean_una(struct sock *sk)
 	}
 
 out:
-	if (cleaned)
-		sk_mem_reclaim_partial(sk);
+	if (cleaned && tcp_under_memory_pressure(sk))
+		mptcp_mem_reclaim_partial(sk);
 }
 
 static void mptcp_clean_una_wakeup(struct sock *sk)
@@ -1248,6 +1266,29 @@ out:
 		__mptcp_check_send_data_fin(sk);
 }
 
+static bool mptcp_wmem_alloc(struct sock *sk, int size)
+{
+	struct mptcp_sock *msk = mptcp_sk(sk);
+	int amount;
+	int ret;
+
+	if (msk->wforward_alloc >= size)
+		goto account;
+
+	ret = sk_wmem_schedule(sk, size);
+	if (!ret)
+		return false;
+
+	/* try to keep half fwd alloc memory for each direction */
+	amount = max(size, sk->sk_forward_alloc >> 1);
+	sk->sk_forward_alloc -= amount;
+	msk->wforward_alloc += amount;
+
+account:
+	msk->wforward_alloc -= size;
+	return ret;
+}
+
 static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
@@ -1308,11 +1349,12 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		offset = dfrag->offset + dfrag->data_len;
 		psize = pfrag->size - offset;
 		psize = min_t(size_t, psize, msg_data_left(msg));
-		if (!sk_wmem_schedule(sk, psize + frag_truesize))
+		if (!mptcp_wmem_alloc(sk, psize + frag_truesize))
 			goto wait_for_memory;
 
 		if (copy_page_from_iter(dfrag->page, offset, psize,
 					&msg->msg_iter) != psize) {
+			mptcp_wmem_uncharge(sk, psize + frag_truesize);
 			ret = -EFAULT;
 			goto out;
 		}
@@ -1328,7 +1370,6 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		 * Note: we charge such data both to sk and ssk
 		 */
 		sk_wmem_queued_add(sk, frag_truesize);
-		sk->sk_forward_alloc -= frag_truesize;
 		if (!dfrag_collapsed) {
 			get_page(dfrag->page);
 			list_add_tail(&dfrag->list, &msk->rtx_queue);
@@ -1951,6 +1992,7 @@ static int __mptcp_init_sock(struct sock *sk)
 	INIT_WORK(&msk->work, mptcp_worker);
 	msk->out_of_order_queue = RB_ROOT;
 	msk->first_pending = NULL;
+	msk->wforward_alloc = 0;
 
 	msk->first = NULL;
 	inet_csk(sk)->icsk_sync_mss = mptcp_sync_mss;
@@ -2140,6 +2182,8 @@ static void __mptcp_destroy_sock(struct sock *sk)
 
 	sk->sk_prot->destroy(sk);
 
+	sk->sk_forward_alloc += msk->wforward_alloc;
+	msk->wforward_alloc = 0;
 	sk_stream_kill_queues(sk);
 	xfrm_sk_free_policy(sk);
 	sk_refcnt_debug_release(sk);
