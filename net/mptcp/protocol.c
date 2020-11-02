@@ -635,6 +635,7 @@ static void move_skbs_to_msk(struct mptcp_sock *msk, struct sock *ssk)
 
 	__mptcp_move_skbs_from_subflow(msk, ssk, &moved);
 	__mptcp_ofo_queue(msk);
+	pr_debug("msk=%p moved=%d", msk, moved);
 
 	/* If the moves have caught up with the DATA_FIN sequence number
 	 * it's time to ack the DATA_FIN and change socket state, but
@@ -731,6 +732,8 @@ void mptcp_data_acked(struct sock *sk)
 
 	/* pairs with mptcp_nospace() */
 	smp_mb();
+	pr_debug("msk=%p una=%lld wspace=%d:%d", sk, atomic64_read(&mptcp_sk(sk)->snd_una),
+	         sk_stream_is_writeable(sk), sk_stream_wspace(sk));
 	if (test_bit(MPTCP_NOSPACE, &mptcp_sk(sk)->flags))
 		sk_stream_write_space(sk);
 
@@ -863,6 +866,8 @@ static void __mptcp_clean_una(struct sock *sk)
 		atomic64_set(&msk->snd_una, msk->snd_nxt);
 
 	snd_una = atomic64_read(&msk->snd_una);
+	pr_debug("msk=%p snd una=%lld snd nxt=%lld next_send_acked_seq=%lld",
+	         msk, snd_una, msk->snd_nxt, msk->next_send_acked_seq);
 
 	list_for_each_entry_safe(dfrag, dtmp, &msk->rtx_queue, list) {
 		if (after64(dfrag->data_seq + dfrag->data_len, snd_una))
@@ -882,6 +887,8 @@ static void __mptcp_clean_una(struct sock *sk)
 	    msk->next_send_acked_bytes + delta < msk->next_send_bytes) {
 		msk->next_send_acked_seq += delta;
 		msk->next_send_acked_bytes += delta;
+		pr_debug("msk=%p delta=%lld acked_seq=%lld bytes=%d", msk,
+		         delta, msk->next_send_acked_seq, msk->next_send_acked_bytes);
 		dfrag_uncharge(sk, delta);
 		cleaned = true;
 	}
@@ -1004,8 +1011,13 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 	/* Zero window and all data acked? Probe. */
 	avail_size = mptcp_check_allowed_size(msk, data_seq, avail_size);
 	if (avail_size == 0) {
-		if (skb || atomic64_read(&msk->snd_una) != msk->snd_nxt)
+		if (skb || atomic64_read(&msk->snd_una) != msk->snd_nxt) {
+			pr_debug("msk=%p snd_nxt=%lld window is closed", msk,
+			         msk->snd_nxt);
 			return 0;
+		}
+		pr_debug("msk=%p snd_nxt=%lld probe at %lld", msk,
+		         msk->snd_nxt, atomic64_read(&msk->snd_una) - 1);
 		zero_window_probe = true;
 		data_seq = atomic64_read(&msk->snd_una) - 1;
 		avail_size = 1;
@@ -1213,6 +1225,8 @@ static void mptcp_update_rtx(struct sock *sk, struct list_head *sent)
 	if (first) {
 		mptcp_update_send_head(msk, first);
 		list_splice_tail(sent, &msk->rtx_queue);
+		pr_debug("msk=%p appending to rtx queue len=%d seq=%lld",
+		         msk, first->data_len, first->data_seq);
 	}
 
 	first = mptcp_send_head(sk);
@@ -1220,6 +1234,9 @@ static void mptcp_update_rtx(struct sock *sk, struct list_head *sent)
 		msk->next_send_acked_seq = first->data_seq +
 					   msk->next_send_acked_bytes;
 		msk->next_send_bytes = first->already_sent;
+		pr_debug("msk=%p sent=%d seq=%lld acked=%d",
+		         msk, first->already_sent, msk->next_send_acked_seq,
+		         msk->next_send_acked_bytes);
 	}
 
 	/* mptcp_update_rtx() is called after pushing data on the subflow
@@ -1247,6 +1264,8 @@ static void mptcp_push_pending(struct sock *sk, unsigned int flags)
 		info.sent = dfrag->already_sent;
 		info.limit = dfrag->data_len;
 		len = dfrag->data_len - dfrag->already_sent;
+		pr_debug("msk=%p frag=%p len=%d sent=%d", msk, dfrag, dfrag->data_len,
+			 dfrag->already_sent);
 		while (len > 0) {
 			int ret = 0;
 
@@ -1445,6 +1464,8 @@ wait_for_memory:
 		mptcp_push_pending(sk, msg->msg_flags);
 		if (tcp_under_memory_pressure(sk))
 			mptcp_mem_reclaim_partial(sk);
+		pr_debug("msk=%p block wmem=%d:%d", msk, sk_stream_is_writeable(sk),
+		         sk_stream_wspace(sk));
 		ret = sk_stream_wait_memory(sk, &timeo);
 		if (ret)
 			goto out;
@@ -1742,12 +1763,37 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 				mptcp_check_for_eof(msk);
 
 			if (sk->sk_shutdown & RCV_SHUTDOWN) {
+				struct mptcp_subflow_context *subflow;
+				bool q1 = skb_queue_empty_lockless(&sk->sk_receive_queue);
+				bool q2 = skb_queue_empty(&msk->receive_queue);
+
 				/* race breaker: the shutdown could be after the
 				 * previous receive queue check
 				 */
 				if (__mptcp_move_skbs(msk, len - copied,
 						      &released))
 					continue;
+
+				mptcp_for_each_subflow(msk, subflow) {
+					pr_info(" msk=%p ssk=%p data_aval=%d state=%d eof=%d", msk, subflow->tcp_sock,
+					         subflow->data_avail, subflow->tcp_sock->sk_state, subflow->rx_eof);
+				}
+				pr_info("msk=%p state=%d rqueue=%d:%d:%d rqueue2=%d:%d:%d", msk, sk->sk_state,
+					skb_queue_empty_lockless(&sk->sk_receive_queue), q1,
+				        skb_queue_len_lockless(&sk->sk_receive_queue), 
+					skb_queue_empty(&msk->receive_queue), q2, skb_queue_len(&msk->receive_queue));
+				if (!skb_queue_empty_lockless(&sk->sk_receive_queue)) {
+					spin_lock_bh(&msk->data_lock);
+					__mptcp_update_rmem(sk, &released);
+					skb_queue_splice_tail_init(&sk->sk_receive_queue,
+								   &msk->receive_queue);
+					pr_info("msk=%p after splice rqueue=%d:%d rqueue2=%d:%d", msk,
+						skb_queue_empty_lockless(&sk->sk_receive_queue), 
+						skb_queue_len_lockless(&sk->sk_receive_queue), 
+						skb_queue_empty(&msk->receive_queue), skb_queue_len(&msk->receive_queue));
+
+					spin_unlock_bh(&msk->data_lock);
+				}
 				break;
 			}
 
@@ -2298,9 +2344,11 @@ static void __mptcp_destroy_sock(struct sock *sk)
 
 	sk->sk_prot->destroy(sk);
 
+	pr_info("msk=%p fwd=%d w=%d", msk, sk->sk_forward_alloc, msk->wforward_alloc);
 	sk->sk_forward_alloc += msk->wforward_alloc;
 	msk->wforward_alloc = 0;
 	sk_stream_kill_queues(sk);
+	pr_info("msk=%p after reclaim fwd=%d w=%d", msk, sk->sk_forward_alloc, msk->wforward_alloc);
 
 	xfrm_sk_free_policy(sk);
 	sk_refcnt_debug_release(sk);
