@@ -40,6 +40,18 @@ struct mptcp_skb_cb {
 
 #define MPTCP_SKB_CB(__skb)	((struct mptcp_skb_cb *)&((__skb)->cb[0]))
 
+void mptcp_dump(struct sk_buff *skb)
+{
+	struct mptcp_ext *mpext = skb_ext_find(skb, SKB_EXT_MPTCP);
+	if (mpext) {
+		pr_debug("skb=%p no mprxt", skb);
+		return;
+	}
+
+	pr_debug("skb=%p map=%d:%llx ack=%d:%llx len=%d", skb, mpext->use_map, 
+	         mpext->data_seq, mpext->use_ack, mpext->data_ack, mpext->data_len);
+}
+
 static struct percpu_counter mptcp_sockets_allocated;
 
 static void __mptcp_destroy_sock(struct sock *sk);

@@ -2576,6 +2576,8 @@ skb_steal_sock(struct sk_buff *skb, bool *refcounted)
 	return NULL;
 }
 
+void mptcp_dump(struct sk_buff *skb);
+
 /* Checks if this SKB belongs to an HW offloaded socket
  * and whether any SW fallbacks are required based on dev.
  * Check decrypted mark in case skb_orphan() cleared socket.
@@ -2590,7 +2592,8 @@ static inline struct sk_buff *sk_validate_xmit_skb(struct sk_buff *skb,
 		skb = sk->sk_validate_xmit_skb(sk, dev, skb);
 #ifdef CONFIG_TLS_DEVICE
 	} else if (unlikely(skb->decrypted)) {
-		pr_warn_ratelimited("unencrypted skb with no associated socket - dropping\n");
+		pr_warn_ratelimited("unencrypted skb %p:%d ext %x with no associated socket %p - dropping\n", skb, skb->len, skb->active_extensions, skb->sk);
+		mptcp_dump(skb);
 		kfree_skb(skb);
 		skb = NULL;
 #endif
