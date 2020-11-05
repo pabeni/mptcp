@@ -189,7 +189,7 @@ static void mptcp_parse_option(const struct sk_buff *skb,
 				ptr += 4;
 			}
 
-			pr_debug("data_ack=%llu", mp_opt->data_ack);
+			pr_debug("64=%d data_ack=%llx", mp_opt->ack64, mp_opt->data_ack);
 		}
 
 		if (mp_opt->use_map) {
@@ -207,7 +207,7 @@ static void mptcp_parse_option(const struct sk_buff *skb,
 			mp_opt->data_len = get_unaligned_be16(ptr);
 			ptr += 2;
 
-			pr_debug("data_seq=%llu subflow_seq=%u data_len=%u",
+			pr_debug("data_seq=%llx subflow_seq=%u data_len=%u",
 				 mp_opt->data_seq, mp_opt->subflow_seq,
 				 mp_opt->data_len);
 		}
@@ -830,7 +830,7 @@ static u64 expand_ack(u64 old_ack, u64 cur_ack, bool use_64bit)
 }
 
 static void ack_update_msk(struct mptcp_sock *msk,
-			   const struct sock *ssk,
+			   struct sock *ssk,
 			   struct mptcp_options_received *mp_opt)
 {
 	u64 new_wnd_end, new_snd_una, snd_nxt = READ_ONCE(msk->snd_nxt);
@@ -854,8 +854,10 @@ static void ack_update_msk(struct mptcp_sock *msk,
 
 	if (after64(new_wnd_end, msk->wnd_end)) {
 		msk->wnd_end = new_wnd_end;
-		if (mptcp_send_head(sk))
-			mptcp_schedule_work(sk);
+		if (!sock_owned_by_user(sk))
+			__mptcp_subflow_push_pending(sk, ssk);
+		else
+			__mptcp_add_to_backlog(sk, MPTCP_PUSH_PENDING);
 	}
 
 	if (after64(new_snd_una, old_snd_una)) {
@@ -915,8 +917,12 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
 	struct mptcp_options_received mp_opt;
 	struct mptcp_ext *mpext;
 
-	if (__mptcp_check_fallback(msk))
+	if (__mptcp_check_fallback(msk)) {
+		mptcp_data_lock(subflow->conn);
+		__mptcp_data_acked(subflow->conn);
+		mptcp_data_unlock(subflow->conn);
 		return;
+	}
 
 	mptcp_get_options(skb, &mp_opt);
 	if (!check_fully_established(msk, sk, subflow, skb, &mp_opt))

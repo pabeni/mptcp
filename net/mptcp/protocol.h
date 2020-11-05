@@ -92,6 +92,8 @@
 #define MPTCP_FALLBACK_DONE	4
 #define MPTCP_WORK_CLOSE_SUBFLOW 5
 #define MPTCP_WORKER_RUNNING	6
+#define MPTCP_PUSH_PENDING	7
+#define MPTCP_CLEAN_UNA	8
 
 static inline bool before64(__u64 seq1, __u64 seq2)
 {
@@ -249,6 +251,9 @@ struct mptcp_sock {
 	struct list_head join_list;
 	struct socket	*subflow; /* outgoing connect/listener/!mp_capable */
 	struct sock	*first;
+
+	struct sk_buff backlog;
+
 	struct mptcp_pm_data	pm;
 	struct {
 		u32	space;	/* bytes copied in last measurement window */
@@ -440,6 +445,9 @@ unsigned int mptcp_get_add_addr_timeout(struct net *net);
 void mptcp_subflow_fully_established(struct mptcp_subflow_context *subflow,
 				     struct mptcp_options_received *mp_opt);
 bool mptcp_subflow_data_available(struct sock *sk);
+void mptcp_push_pending(struct sock *sk, unsigned int flags);
+void __mptcp_subflow_push_pending(struct sock *sk, struct sock *ssk);
+void __mptcp_add_to_backlog(struct sock *sk, int event);
 void __init mptcp_subflow_init(void);
 void mptcp_subflow_shutdown(struct sock *sk, struct sock *ssk, int how);
 void __mptcp_close_ssk(struct sock *sk, struct sock *ssk,
