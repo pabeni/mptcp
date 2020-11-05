@@ -1142,7 +1142,7 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 	struct mptcp_sock *msk = mptcp_sk(sk);
 	bool zero_window_probe = false;
 	struct mptcp_ext *mpext = NULL;
-	struct sk_buff *skb, *tail;
+	struct sk_buff *skb, *tail, *s;
 	bool can_collapse = false;
 	int avail_size;
 	size_t ret = 0;
@@ -1151,6 +1151,7 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 		 msk, ssk, dfrag->data_seq, dfrag->data_len, info->sent);
 
 	/* compute send limit */
+	s = ssk->sk_tx_skb_cache;
 	info->mss_now = tcp_send_mss(ssk, &info->size_goal, info->flags);
 	avail_size = info->size_goal;
 	msk->size_goal_cache = info->size_goal;
@@ -1206,6 +1207,7 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
 
 	mpext = skb_ext_find(tail, SKB_EXT_MPTCP);
 	if (WARN_ON_ONCE(!mpext)) {
+		pr_info("msk=%p tail=%p cache=%p:%d", msk, tail, s, s == NULL);
 		/* should never reach here, stream corrupted */
 		return -EINVAL;
 	}
@@ -2936,6 +2938,7 @@ static struct proto mptcp_prot = {
 	.memory_allocated	= &tcp_memory_allocated,
 	.memory_pressure	= &tcp_memory_pressure,
 	.sysctl_wmem_offset	= offsetof(struct net, ipv4.sysctl_tcp_wmem),
+	.sysctl_rmem_offset	= offsetof(struct net, ipv4.sysctl_tcp_rmem),
 	.sysctl_mem	= sysctl_tcp_mem,
 	.obj_size	= sizeof(struct mptcp_sock),
 	.slab_flags	= SLAB_TYPESAFE_BY_RCU,
