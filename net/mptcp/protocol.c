@@ -337,17 +337,22 @@ static void mptcp_stop_timer(struct sock *sk)
 	mptcp_sk(sk)->timer_ival = 0;
 }
 
+static bool mptcp_pending_data_fin_ack(struct sock *sk)
+{
+	struct mptcp_sock *msk = mptcp_sk(sk);
+
+	return !__mptcp_check_fallback(msk) &&
+	       ((1 << sk->sk_state) &
+	        (TCPF_FIN_WAIT1 | TCPF_CLOSING | TCPF_LAST_ACK)) &&
+	       msk->write_seq == READ_ONCE(msk->snd_una);
+}
+
 static void mptcp_check_data_fin_ack(struct sock *sk)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
 
-	if (__mptcp_check_fallback(msk))
-		return;
-
 	/* Look for an acknowledged DATA_FIN */
-	if (((1 << sk->sk_state) &
-	     (TCPF_FIN_WAIT1 | TCPF_CLOSING | TCPF_LAST_ACK)) &&
-	    msk->write_seq == READ_ONCE(msk->snd_una)) {
+	if (mptcp_pending_data_fin_ack(sk)) {
 		mptcp_stop_timer(sk);
 
 		WRITE_ONCE(msk->snd_data_fin_enable, 0);
@@ -743,13 +748,16 @@ bool mptcp_schedule_work(struct sock *sk)
 	return false;
 }
 
+static void __mptcp_clean_una(struct sock *sk);
+
 void __mptcp_data_acked(struct sock *sk)
 {
-	mptcp_reset_timer(sk);
+	if (!sock_owned_by_user(sk))
+		__mptcp_clean_una(sk);
+	else
+		__mptcp_add_to_backlog(sk, MPTCP_CLEAN_UNA);
 
-	if ((test_bit(MPTCP_NOSPACE, &mptcp_sk(sk)->flags) ||
-	     mptcp_send_head(sk) ||
-	     (inet_sk_state_load(sk) != TCP_ESTABLISHED)))
+	if (mptcp_pending_data_fin_ack(sk))
 		mptcp_schedule_work(sk);
 }
 
@@ -875,7 +883,7 @@ static void mptcp_mem_reclaim_partial(struct sock *sk)
 
 static void dfrag_uncharge(struct sock *sk, int len)
 {
-	mptcp_wmem_uncharge(sk, len);
+	sk_mem_uncharge(sk, len);
 	sk_wmem_queued_add(sk, -len);
 }
 
@@ -888,7 +896,7 @@ static void dfrag_clear(struct sock *sk, struct mptcp_data_frag *dfrag)
 	put_page(dfrag->page);
 }
 
-static void mptcp_clean_una(struct sock *sk)
+static void __mptcp_clean_una(struct sock *sk)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
 	struct mptcp_data_frag *dtmp, *dfrag;
@@ -930,20 +938,19 @@ static void mptcp_clean_una(struct sock *sk)
 
 out:
 	if (cleaned && tcp_under_memory_pressure(sk))
-		mptcp_mem_reclaim_partial(sk);
+		sk_mem_reclaim_partial(sk);
+	if (snd_una == READ_ONCE(msk->snd_nxt)) {
+		if (msk->timer_ival)
+			mptcp_stop_timer(sk);
+	} else
+		mptcp_reset_timer(sk);
 }
 
-static void mptcp_clean_una_wakeup(struct sock *sk)
+static void mptcp_clean_una(struct sock *sk)
 {
-	struct mptcp_sock *msk = mptcp_sk(sk);
-
-	mptcp_clean_una(sk);
-
-	/* Only wake up writers if a subflow is ready */
-	if (sk_stream_is_writeable(sk)) {
-		clear_bit(MPTCP_NOSPACE, &msk->flags);
-		sk_stream_write_space(sk);
-	}
+	mptcp_data_lock(sk);
+	__mptcp_clean_una(sk);
+	mptcp_data_unlock(sk);
 }
 
 static void mptcp_enter_memory_pressure(struct sock *sk)
@@ -1029,13 +1036,13 @@ static bool __mptcp_add_ext(struct sk_buff *skb, gfp_t gfp)
 	return true;
 }
 
-static struct sk_buff *__mptcp_do_alloc_tx_skb(struct sock *sk)
+static struct sk_buff *__mptcp_do_alloc_tx_skb(struct sock *sk, gfp_t gfp)
 {
 	struct sk_buff *skb;
 
-	skb = alloc_skb_fclone(MAX_TCP_HEADER, sk->sk_allocation);
+	skb = alloc_skb_fclone(MAX_TCP_HEADER, gfp);
 	if (likely(skb)) {
-		if (likely(__mptcp_add_ext(skb, sk->sk_allocation))) {
+		if (likely(__mptcp_add_ext(skb, gfp))) {
 			skb_reserve(skb, MAX_TCP_HEADER);
 			skb->reserved_tailroom = skb->end - skb->tail;
 			return skb;
@@ -1059,7 +1066,7 @@ static bool mptcp_tx_cache_refill(struct sock *sk, int size)
 	space_needed = msk->tx_pending_data + size -
 		       msk->skb_tx_cache.qlen * msk->size_goal_cache;
 	while (space_needed > 0) {
-		skb = __mptcp_do_alloc_tx_skb(sk);
+		skb = __mptcp_do_alloc_tx_skb(sk, sk->sk_allocation);
 		if (!skb)
 			return false;
 
@@ -1074,7 +1081,7 @@ static bool mptcp_tx_cache_refill(struct sock *sk, int size)
 	return true;
 }
 
-static bool __mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
+static bool __mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk, gfp_t gfp)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
 	struct sk_buff *skb;
@@ -1082,7 +1089,7 @@ static bool __mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
 	if (ssk->sk_tx_skb_cache) {
 		skb = ssk->sk_tx_skb_cache;
 		if (unlikely(!skb_ext_find(skb, SKB_EXT_MPTCP) &&
-			     !__mptcp_add_ext(skb, sk->sk_allocation)))
+			     !__mptcp_add_ext(skb, gfp)))
 			return false;
 		return true;
 	}
@@ -1103,7 +1110,7 @@ static bool __mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
 		return false;
 	}
 
-	skb = __mptcp_do_alloc_tx_skb(sk);
+	skb = __mptcp_do_alloc_tx_skb(sk, gfp);
 	if (!skb)
 		return false;
 
@@ -1126,7 +1133,7 @@ static bool mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
 {
 	if (unlikely(mptcp_must_reclaim_memory(sk, ssk)))
 		mptcp_mem_reclaim_partial(sk);
-	return __mptcp_alloc_tx_skb(sk, ssk);
+	return __mptcp_alloc_tx_skb(sk, ssk, sk->sk_allocation);
 }
 
 static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
@@ -1227,17 +1234,6 @@ out:
 	return ret;
 }
 
-static void mptcp_nospace(struct mptcp_sock *msk)
-{
-	set_bit(MPTCP_NOSPACE, &msk->flags);
-	smp_mb__after_atomic(); /* msk->flags is changed by write_space cb */
-
-	/* mptcp_data_acked() could run just before we set the NOSPACE bit,
-	 * so explicitly check for snd_una value
-	 */
-	mptcp_clean_una((struct sock *)msk);
-}
-
 #define MPTCP_SEND_BURST_SIZE		((1 << 16) - \
 					 sizeof(struct tcphdr) - \
 					 MAX_TCP_OPTION_SPACE - \
@@ -1332,7 +1328,7 @@ static void mptcp_push_release(struct sock *sk, struct sock *ssk,
 	release_sock(ssk);
 }
 
-static void mptcp_push_pending(struct sock *sk, unsigned int flags)
+void mptcp_push_pending(struct sock *sk, unsigned int flags)
 {
 	struct sock *prev_ssk = NULL, *ssk = NULL;
 	struct mptcp_sock *msk = mptcp_sk(sk);
@@ -1402,10 +1398,62 @@ static void mptcp_push_pending(struct sock *sk, unsigned int flags)
 
 out:
 	/* start the timer, if it's not pending */
-	if (!mptcp_timer_pending(sk))
-		mptcp_reset_timer(sk);
-	if (copied)
+	if (copied) {
+		if (!mptcp_timer_pending(sk))
+			mptcp_reset_timer(sk);
 		__mptcp_check_send_data_fin(sk);
+	}
+}
+
+void __mptcp_subflow_push_pending(struct sock *sk, struct sock *ssk)
+{
+	struct mptcp_sock *msk = mptcp_sk(sk);
+	struct mptcp_sendmsg_info info;
+	struct mptcp_data_frag *dfrag;
+	int len, copied = 0;
+	u32 sndbuf;
+
+	while ((dfrag = mptcp_send_head(sk))) {
+		info.sent = dfrag->already_sent;
+		info.limit = dfrag->data_len;
+		len = dfrag->data_len - dfrag->already_sent;
+		while (len > 0) {
+			int ret = 0;
+
+			/* do auto tuning */
+			if (!(sk->sk_userlocks & SOCK_SNDBUF_LOCK) &&
+			    sndbuf > READ_ONCE(sk->sk_sndbuf))
+				WRITE_ONCE(sk->sk_sndbuf, sndbuf);
+
+			if (unlikely(mptcp_must_reclaim_memory(sk, ssk)))
+				__mptcp_mem_reclaim_partial(sk);
+			if (!__mptcp_alloc_tx_skb(sk, ssk, GFP_ATOMIC))
+				goto out;
+
+			ret = mptcp_sendmsg_frag(sk, ssk, dfrag, &info);
+			if (ret <= 0)
+				goto out;
+
+			info.sent += ret;
+			dfrag->already_sent += ret;
+			msk->snd_nxt += ret;
+			msk->snd_burst -= ret;
+			msk->tx_pending_data -= ret;
+			copied += ret;
+			len -= ret;
+		}
+		WRITE_ONCE(msk->first_pending, mptcp_send_next(sk));
+	}
+
+out:
+	if (copied) {
+		mptcp_set_timeout(sk, ssk);
+		tcp_push(ssk, 0, info.mss_now, tcp_sk(ssk)->nonagle,
+			 info.size_goal);
+		if (msk->snd_data_fin_enable &&
+		    msk->snd_nxt + 1 == msk->write_seq)
+			mptcp_schedule_work(sk);
+	}
 }
 
 static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
@@ -1430,7 +1478,6 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 	}
 
 	pfrag = sk_page_frag(sk);
-	mptcp_clean_una(sk);
 
 	while (msg_data_left(msg)) {
 		struct mptcp_data_frag *dfrag;
@@ -1450,7 +1497,6 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		dfrag_collapsed = mptcp_frag_can_collapse_to(msk, pfrag, dfrag);
 		if (!dfrag_collapsed) {
 			if (!sk_stream_memory_free(sk)) {
-				mptcp_push_pending(sk, msg->msg_flags);
 				if (!sk_stream_memory_free(sk))
 					goto wait_for_memory;
 			}
@@ -1505,9 +1551,8 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		continue;
 
 wait_for_memory:
-		mptcp_nospace(msk);
-		if (mptcp_timer_pending(sk))
-			mptcp_reset_timer(sk);
+		mptcp_push_pending(sk, msg->msg_flags);
+		set_bit(MPTCP_NOSPACE, &msk->flags);
 		ret = sk_stream_wait_memory(sk, &timeo);
 		if (ret)
 			goto out;
@@ -2067,14 +2112,10 @@ static void mptcp_worker(struct work_struct *work)
 	if (unlikely(state == TCP_CLOSE))
 		goto unlock;
 
-	mptcp_clean_una_wakeup(sk);
 	mptcp_check_data_fin_ack(sk);
 	__mptcp_flush_join_list(msk);
 	if (test_and_clear_bit(MPTCP_WORK_CLOSE_SUBFLOW, &msk->flags))
 		__mptcp_close_subflow(msk);
-
-	if (mptcp_send_head(sk))
-		mptcp_push_pending(sk, 0);
 
 	if (msk->pm.status)
 		pm_work(msk);
@@ -2082,6 +2123,7 @@ static void mptcp_worker(struct work_struct *work)
 	if (test_and_clear_bit(MPTCP_WORK_EOF, &msk->flags))
 		mptcp_check_for_eof(msk);
 
+	__mptcp_check_send_data_fin(sk);
 	mptcp_check_data_fin(sk);
 
 	/* if the msk data is completely acked, or the socket timedout,
@@ -2160,6 +2202,8 @@ static int __mptcp_init_sock(struct sock *sk)
 	msk->size_goal_cache = TCP_BASE_MSS;
 
 	msk->ack_hint = NULL;
+	msk->backlog.len = 0;
+	msk->backlog.truesize = 0;
 	msk->first = NULL;
 	inet_csk(sk)->icsk_sync_mss = mptcp_sync_mss;
 
@@ -2712,6 +2756,28 @@ static int mptcp_getsockopt(struct sock *sk, int level, int optname,
 	return -EOPNOTSUPP;
 }
 
+void __mptcp_add_to_backlog(struct sock *sk, int event)
+{
+	struct mptcp_sock *msk = mptcp_sk(sk);
+
+	if (!sk->sk_backlog.tail)
+		__sk_add_backlog(sk, &msk->backlog);
+
+	set_bit(event, &msk->flags);
+}
+
+int mptcp_do_backlog(struct sock *sk, struct sk_buff *skb)
+{
+	struct mptcp_sock *msk = mptcp_sk(sk);
+
+	if (test_and_clear_bit(MPTCP_CLEAN_UNA, &msk->flags))
+		mptcp_clean_una(sk);
+
+	if (test_and_clear_bit(MPTCP_PUSH_PENDING, &msk->flags))
+		mptcp_push_pending(sk, 0);
+	return 0;
+}
+
 #define MPTCP_DEFERRED_ALL (TCPF_WRITE_TIMER_DEFERRED)
 
 /* this is very alike tcp_release_cb() but we must handle differently a
@@ -2865,6 +2931,7 @@ static struct proto mptcp_prot = {
 	.destroy	= mptcp_destroy,
 	.sendmsg	= mptcp_sendmsg,
 	.recvmsg	= mptcp_recvmsg,
+	.backlog_rcv	= mptcp_do_backlog,
 	.release_cb	= mptcp_release_cb,
 	.hash		= mptcp_hash,
 	.unhash		= mptcp_unhash,
@@ -3053,24 +3120,9 @@ static __poll_t mptcp_check_readable(struct mptcp_sock *msk)
 	       0;
 }
 
-static bool __mptcp_check_writeable(struct mptcp_sock *msk)
-{
-	struct sock *sk = (struct sock *)msk;
-	bool mptcp_writable;
-
-	mptcp_clean_una(sk);
-	mptcp_writable = sk_stream_is_writeable(sk);
-	if (!mptcp_writable)
-		mptcp_nospace(msk);
-
-	return mptcp_writable;
-}
-
 static __poll_t mptcp_check_writeable(struct mptcp_sock *msk)
 {
 	struct sock *sk = (struct sock *)msk;
-	__poll_t ret = 0;
-	bool slow;
 
 	if (unlikely(sk->sk_shutdown & SEND_SHUTDOWN))
 		return 0;
@@ -3078,12 +3130,12 @@ static __poll_t mptcp_check_writeable(struct mptcp_sock *msk)
 	if (sk_stream_is_writeable(sk))
 		return EPOLLOUT | EPOLLWRNORM;
 
-	slow = lock_sock_fast(sk);
-	if (__mptcp_check_writeable(msk))
-		ret = EPOLLOUT | EPOLLWRNORM;
+	set_bit(MPTCP_NOSPACE, &msk->flags);
+	smp_mb__after_atomic(); /* msk->flags is changed by write_space cb */
+	if (sk_stream_is_writeable(sk))
+		return EPOLLOUT | EPOLLWRNORM;
 
-	unlock_sock_fast(sk, slow);
-	return ret;
+	return 0;
 }
 
 static __poll_t mptcp_poll(struct file *file, struct socket *sock,
