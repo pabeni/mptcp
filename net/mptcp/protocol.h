@@ -92,6 +92,8 @@
 #define MPTCP_FALLBACK_DONE	4
 #define MPTCP_WORK_CLOSE_SUBFLOW 5
 #define MPTCP_WORKER_RUNNING	6
+#define MPTCP_PUSH_PENDING	7
+#define MPTCP_CLEAN_UNA	8
 
 static inline bool before64(__u64 seq1, __u64 seq2)
 {
@@ -250,6 +252,9 @@ struct mptcp_sock {
 	struct list_head join_list;
 	struct socket	*subflow; /* outgoing connect/listener/!mp_capable */
 	struct sock	*first;
+
+	struct sk_buff bl_entry;
+
 	struct mptcp_pm_data	pm;
 	struct {
 		u32	space;	/* bytes copied in last measurement window */
@@ -497,6 +502,7 @@ void mptcp_rcv_space_init(struct mptcp_sock *msk, const struct sock *ssk);
 void mptcp_data_ready(struct sock *sk, struct sock *ssk);
 bool mptcp_finish_join(struct sock *sk);
 bool mptcp_schedule_work(struct sock *sk);
+void __mptcp_wnd_updated(struct sock *sk, struct sock *ssk);
 void __mptcp_data_acked(struct sock *sk);
 void mptcp_subflow_eof(struct sock *sk);
 bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq, bool use_64bit);
