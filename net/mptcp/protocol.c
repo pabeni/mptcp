@@ -1090,9 +1090,12 @@ static bool __mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk, gfp_t gfp)
 	}
 
 	skb = skb_peek(&msk->skb_tx_cache);
+	pr_debug("msk=%p tx=%p skb=%p", msk, msk->skb_tx_cache.next, skb);
 	if (skb) {
 		if (likely(sk_wmem_schedule(ssk, skb->truesize))) {
+			pr_debug("msk=%p tx=%p ts=%d", msk, msk->skb_tx_cache.next, skb->truesize);
 			skb = __skb_dequeue(&msk->skb_tx_cache);
+			pr_debug("   skb=%p", skb);
 			if (WARN_ON_ONCE(!skb))
 				return false;
 
