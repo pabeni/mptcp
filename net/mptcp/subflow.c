@@ -996,19 +996,28 @@ static void subflow_data_ready(struct sock *sk)
 		mptcp_data_ready(parent, sk);
 }
 
-static void subflow_write_space(struct sock *sk)
+static void subflow_write_space(struct sock *ssk)
 {
-	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
-	struct socket *sock = READ_ONCE(sk->sk_socket);
-	struct sock *parent = subflow->conn;
+	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+	struct sock *sk = subflow->conn;
+	struct socket_wq *wq;
 
-	if (!sk_stream_is_writeable(sk))
+	if (!sk_stream_is_writeable(ssk) || !sk_stream_is_writeable(sk) ||
+	    !sk->sk_socket || !test_bit(MPTCP_NOSPACE, &mptcp_sk(sk)->flags))
 		return;
 
-	if (sock && sk_stream_is_writeable(parent))
-		clear_bit(SOCK_NOSPACE, &sock->flags);
-
-	sk_stream_write_space(parent);
+	/* The following is quite alike sk_stream_write_space, but avoids
+	 * clearing the sk SOCK_NOSPACE bit
+	 */
+	clear_bit(MPTCP_NOSPACE, &mptcp_sk(sk)->flags);
+	rcu_read_lock();
+	wq = rcu_dereference(sk->sk_wq);
+	if (skwq_has_sleeper(wq))
+		wake_up_interruptible_poll(&wq->wait, EPOLLOUT |
+					   EPOLLWRNORM | EPOLLWRBAND);
+	if (wq && wq->fasync_list && !(sk->sk_shutdown & SEND_SHUTDOWN))
+		sock_wake_async(wq, SOCK_WAKE_SPACE, POLL_OUT);
+	rcu_read_unlock();
 }
 
 static struct inet_connection_sock_af_ops *
@@ -1208,6 +1217,10 @@ int mptcp_subflow_create_socket(struct sock *sk, struct socket **new_sock)
 	SOCK_INODE(sf)->i_uid = SOCK_INODE(sk->sk_socket)->i_uid;
 	SOCK_INODE(sf)->i_gid = SOCK_INODE(sk->sk_socket)->i_gid;
 
+	/* subflows will always call into sk_write_space, and subflow_write_space()
+	 * will be responsible of doing the actual wake-up
+	 */
+	set_bit(SOCK_NOSPACE, &sf->flags);
 	subflow = mptcp_subflow_ctx(sf->sk);
 	pr_debug("subflow=%p", subflow);
 
