@@ -1329,22 +1329,8 @@ out:
 
 static void mptcp_nospace(struct mptcp_sock *msk)
 {
-	struct mptcp_subflow_context *subflow;
-
 	set_bit(MPTCP_NOSPACE, &msk->flags);
 	smp_mb__after_atomic(); /* msk->flags is changed by write_space cb */
-
-	mptcp_for_each_subflow(msk, subflow) {
-		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
-		bool ssk_writeable = sk_stream_is_writeable(ssk);
-		struct socket *sock = READ_ONCE(ssk->sk_socket);
-
-		if (ssk_writeable || !sock)
-			continue;
-
-		/* enables ssk->write_space() callbacks */
-		set_bit(SOCK_NOSPACE, &sock->flags);
-	}
 
 	/* mptcp_data_acked() could run just before we set the NOSPACE bit,
 	 * so explicitly check for snd_una value
@@ -3136,6 +3122,7 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
 		slowpath = lock_sock_fast(newsk);
 		mptcp_copy_inaddrs(newsk, msk->first);
 		mptcp_rcv_space_init(msk, msk->first);
+		set_bit(SOCK_NOSPACE, &newsock->flags);
 
 		/* set ssk->sk_socket of accept()ed flows to mptcp socket.
 		 * This is needed so NOSPACE flag can be set from tcp stack.
