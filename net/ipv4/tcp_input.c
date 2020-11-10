@@ -5128,6 +5128,8 @@ restart:
 		memcpy(nskb->cb, skb->cb, sizeof(skb->cb));
 #ifdef CONFIG_TLS_DEVICE
 		nskb->decrypted = skb->decrypted;
+		if (nskb->decrypted)
+			pr_info("sk=%p skb=%p orig=%p", sk, nskb,  skb);
 #endif
 		TCP_SKB_CB(nskb)->seq = TCP_SKB_CB(nskb)->end_seq = start;
 		if (list)
