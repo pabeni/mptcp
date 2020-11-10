@@ -1002,6 +1002,9 @@ static void subflow_write_space(struct sock *ssk)
 	struct sock *sk = subflow->conn;
 	struct socket_wq *wq;
 
+	pr_debug("msk=%p:%d:%d:%d ssk=%p:%d socket=%p:%d flags=%lx", sk, sk_stream_is_writeable(sk),
+		sk->sk_wmem_queued, sk->sk_sndbuf,
+		ssk, sk_stream_is_writeable(ssk), sk->sk_socket, !!sk->sk_socket, mptcp_sk(sk)->flags);
 	if (!sk_stream_is_writeable(ssk) || !sk_stream_is_writeable(sk) ||
 	    !sk->sk_socket || !test_bit(MPTCP_NOSPACE, &mptcp_sk(sk)->flags))
 		return;
@@ -1292,6 +1295,8 @@ static void subflow_state_change(struct sock *sk)
 	if (mptcp_subflow_data_available(sk))
 		mptcp_data_ready(parent, sk);
 
+	pr_debug("msk=%p ssk=%p fallback=%d eof=%d:%d", parent, sk,
+	         __mptcp_check_fallback(mptcp_sk(parent)), subflow->rx_eof, subflow_is_done(sk));
 	if (__mptcp_check_fallback(mptcp_sk(parent)) &&
 	    !subflow->rx_eof && subflow_is_done(sk)) {
 		subflow->rx_eof = 1;
