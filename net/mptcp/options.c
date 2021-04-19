@@ -39,8 +39,6 @@ static void mptcp_parse_option(const struct sock *sk,
 		if (!(TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)) {
 			if (skb->len > tcp_hdr(skb)->doff << 2) {
 				expected_opsize = TCPOLEN_MPTCP_MPC_ACK_DATA;
-				if (READ_ONCE(msk->csum_enabled))
-					expected_opsize += TCPOLEN_MPTCP_DSS_CHECKSUM;
 			} else {
 				expected_opsize = TCPOLEN_MPTCP_MPC_ACK;
 			}
@@ -50,7 +48,20 @@ static void mptcp_parse_option(const struct sock *sk,
 			else
 				expected_opsize = TCPOLEN_MPTCP_MPC_SYN;
 		}
-		if (opsize != expected_opsize)
+
+		/* Cfr RFC 8684 Section 3.3.0:
+		 * If a checksum is present but its use had
+		 * not been negotiated in the MP_CAPABLE handshake, the receiver MUST
+		 * close the subflow with a RST, as it is not behaving as negotiated.
+		 * If a checksum is not present when its use has been negotiated, the
+		 * receiver MUST close the subflow with a RST, as it is considered
+		 * broken
+		 * We parse even option with mismatching csum presence, so that
+		 * later in subflow_data_ready we can trigger the reset.
+		 */
+		if ((opsize != expected_opsize) &&
+		    (expected_opsize != TCPOLEN_MPTCP_MPC_ACK_DATA ||
+		     opsize != TCPOLEN_MPTCP_MPC_ACK_DATA_CSUM))
 			break;
 
 		/* try to be gentle vs future versions on the initial syn */
@@ -72,11 +83,6 @@ static void mptcp_parse_option(const struct sock *sk,
 		 * host requires the use of checksums, checksums MUST be used.
 		 * In other words, the only way for checksums not to be used
 		 * is if both hosts in their SYNs set A=0."
-		 *
-		 * Section 3.3.0:
-		 * "If a checksum is not present when its use has been
-		 * negotiated, the receiver MUST close the subflow with a RST as
-		 * it is considered broken."
 		 */
 		mp_opt->csum_reqd = READ_ONCE(msk->csum_enabled);
 		if (flags & MPTCP_CAP_CHECKSUM_REQD)
@@ -103,8 +109,9 @@ static void mptcp_parse_option(const struct sock *sk,
 			mp_opt->data_len = get_unaligned_be16(ptr);
 			ptr += 2;
 		}
-		if (opsize == TCPOLEN_MPTCP_MPC_ACK_DATA + TCPOLEN_MPTCP_DSS_CHECKSUM) {
+		if (opsize == TCPOLEN_MPTCP_MPC_ACK_DATA_CSUM) {
 			mp_opt->csum = (__force __sum16)get_unaligned_be16(ptr);
+			mp_opt->csum_reqd = 1;
 			ptr += 2;
 		}
 		pr_debug("MP_CAPABLE version=%x, flags=%x, optlen=%d sndr=%llu, rcvr=%llu len=%d csum=%u",
@@ -353,7 +360,6 @@ void mptcp_get_options(const struct sock *sk,
 	mp_opt->mp_prio = 0;
 	mp_opt->reset = 0;
 	mp_opt->csum_reqd = 0;
-	mp_opt->csum = 0;
 
 	length = (th->doff * 4) - sizeof(struct tcphdr);
 	ptr = (const unsigned char *)(th + 1);
@@ -1126,8 +1132,9 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
 		}
 		mpext->data_len = mp_opt.data_len;
 		mpext->use_map = 1;
+		mpext->csum_reqd = mp_opt.csum_reqd;
 
-		if (READ_ONCE(msk->csum_enabled))
+		if (mpext->csum_reqd)
 			mpext->csum = mp_opt.csum;
 	}
 }
