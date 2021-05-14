@@ -2694,6 +2694,8 @@ static void __mptcp_destroy_sock(struct sock *sk)
 	WARN_ON_ONCE(msk->wmem_reserved);
 	WARN_ON_ONCE(msk->rmem_released);
 	sk_stream_kill_queues(sk);
+	if (sk->sk_forward_alloc)
+		pr_warn("sk=%p fwd=%d", sk, sk->sk_forward_alloc);
 	xfrm_sk_free_policy(sk);
 
 	sk_refcnt_debug_release(sk);

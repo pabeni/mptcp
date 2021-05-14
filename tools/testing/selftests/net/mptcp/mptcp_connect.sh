@@ -508,6 +508,12 @@ do_transfer()
 	check_transfer $cin $sout "file received by server"
 	rets=$?
 
+	local tcp_mem=`head -n 2 /proc/net/sockstat|tail -n 1| awk '{print $11}'`
+        if [ $tcp_mem -lt 0 ]; then
+                echo "[ FAIL ] bad tcp mem $tcp_mem"
+                retc=1
+        fi
+
 	local stat_synrx_now_l=$(get_mib_counter "${listener_ns}" "MPTcpExtMPCapableSYNRX")
 	local stat_ackrx_now_l=$(get_mib_counter "${listener_ns}" "MPTcpExtMPCapableACKRX")
 	local stat_cookietx_now=$(get_mib_counter "${listener_ns}" "TcpExtSyncookiesSent")
