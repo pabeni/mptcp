@@ -111,6 +111,7 @@
 #define MPTCP_ERROR_REPORT	8
 #define MPTCP_RETRANSMIT	9
 #define MPTCP_WORK_SYNC_SETSOCKOPT 10
+#define MPTCP_DEQUEUE		11
 
 static inline bool before64(__u64 seq1, __u64 seq2)
 {
@@ -244,7 +245,6 @@ struct mptcp_sock {
 	struct work_struct work;
 	struct sk_buff  *ooo_last_skb;
 	struct rb_root  out_of_order_queue;
-	struct sk_buff_head receive_queue;
 	int		tx_pending_data;
 	int		size_goal_cache;
 	struct list_head conn_list;
