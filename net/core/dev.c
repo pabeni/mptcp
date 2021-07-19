@@ -6022,6 +6022,7 @@ static void gro_list_prepare(const struct list_head *head,
 			struct tc_skb_ext *p_ext;
 #endif
 
+			diffs |= p->sk != skb->sk;
 			diffs |= skb_metadata_dst_cmp(p, skb);
 			diffs |= skb_get_nfct(p) ^ skb_get_nfct(skb);
 

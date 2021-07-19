@@ -947,6 +947,7 @@ void napi_skb_free_stolen_head(struct sk_buff *skb)
 		nf_reset_ct(skb);
 		skb_dst_drop(skb);
 		skb_ext_put(skb);
+		skb_orphan(skb);
 	}
 	napi_skb_cache_put(skb);
 }
@@ -4285,7 +4286,7 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 		delta_truesize = skb->truesize -
 				 SKB_TRUESIZE(skb_end_offset(skb));
 
-		skb->truesize -= skb->data_len;
+		/* napi_reuse_skb() will always re-init 'truesize' */
 		skb->len -= skb->data_len;
 		skb->data_len = 0;
 
@@ -4297,6 +4298,7 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 		struct page *page = virt_to_head_page(skb->head);
 		unsigned int first_size = headlen - offset;
 		unsigned int first_offset;
+		unsigned int new_truesize;
 
 		if (nr_frags + 1 + skbinfo->nr_frags > MAX_SKB_FRAGS)
 			goto merge;
@@ -4314,12 +4316,16 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 		memcpy(frag + 1, skbinfo->frags, sizeof(*frag) * skbinfo->nr_frags);
 		/* We dont need to clear skbinfo->nr_frags here */
 
-		delta_truesize = skb->truesize - SKB_DATA_ALIGN(sizeof(struct sk_buff));
+		new_truesize = SKB_TRUESIZE(sizeof(struct sk_buff));
+		delta_truesize = skb->truesize - new_truesize;
+		skb->truesize = new_truesize;
 		NAPI_GRO_CB(skb)->free = NAPI_GRO_FREE_STOLEN_HEAD;
 		goto done;
 	}
 
 merge:
+	/* sk owenrship - if any - completely transferred to the aggregated packet */
+	skb->destructor = NULL;
 	delta_truesize = skb->truesize;
 	if (offset > headlen) {
 		unsigned int eat = offset - headlen;
